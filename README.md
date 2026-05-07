@@ -311,6 +311,8 @@ Enables prefix-cache stickiness on the Codex backend. When multiple requests sha
 
 **When to use:** Set a stable key per conversation or session. All turns within the same session should share one key.
 
+**Important:** Do not use `usage.prompt_tokens_details.cached_tokens` (or `usage.input_tokens_details.cached_tokens`) as a prompt or context-management signal. This server passes through the Codex backend usage payload when it is available, and current Codex OAuth responses may report `cached_tokens: 0` even when `prompt_cache_key` is used. Treat `prompt_cache_key` as a backend cache-affinity hint, not as a guarantee that cache-hit accounting will be exposed through the API response.
+
 ```bash
 curl http://localhost:18080/v1/chat/completions \
   -H "Content-Type: application/json" \
