@@ -168,10 +168,18 @@ Railway does not use the Compose-only `codex-login` service. Instead, attach a
 Railway volume mounted at `/codex-home` and deploy the Dockerfile normally. The
 image already has `codex` installed, and `CODEX_HOME` defaults to `/codex-home`.
 
+Before the first deploy:
+
+1. Create a Railway service from this repository.
+2. Attach a Railway volume to the service with mount path `/codex-home`.
+3. Add the variables below.
+4. Deploy, then run `codex login` from the service shell.
+
 Set these Railway variables:
 
 ```bash
 CODEX_HOME=/codex-home
+CODEX_CLI_VERSION=0.129.0
 CODEX_AS_API_AUTH_PATH=/codex-home/auth.json
 CODEX_AS_API_HOST=0.0.0.0
 CODEX_AS_API_MODEL=gpt-5.5
