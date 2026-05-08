@@ -168,6 +168,22 @@ Railway does not use the Compose-only `codex-login` service. Instead, attach a
 Railway volume mounted at `/codex-home` and deploy the Dockerfile normally. The
 image already has `codex` installed, and `CODEX_HOME` defaults to `/codex-home`.
 
+Set these Railway variables:
+
+```bash
+CODEX_HOME=/codex-home
+CODEX_AS_API_AUTH_PATH=/codex-home/auth.json
+CODEX_AS_API_HOST=0.0.0.0
+CODEX_AS_API_MODEL=gpt-5.5
+CODEX_AS_API_WORKERS=2
+CODEX_AS_API_WORKER_TIMEOUT=0
+CODEX_AS_API_GRACEFUL_TIMEOUT=30
+CODEX_AS_API_KEEP_ALIVE=5
+CODEX_AS_API_API_KEY=<generate-a-secret>
+```
+
+Railway provides `PORT`; do not set it manually.
+
 On the first deploy, `GET /` and `GET /health` will show
 `"auth_status": "required"`, and API endpoints return `401` until credentials
 exist. Open a shell in the running Railway service and run:
