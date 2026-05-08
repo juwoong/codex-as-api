@@ -1,0 +1,53 @@
+services:
+  codex-as-api:
+    build:
+      context: .
+      args:
+        CODEX_CLI_VERSION: ${CODEX_CLI_VERSION:-0.129.0}
+    image: codex-as-api:local
+    restart: unless-stopped
+    ports:
+      - "${CODEX_AS_API_PORT:-18080}:18080"
+    environment:
+      CODEX_AS_API_HOST: 0.0.0.0
+      CODEX_AS_API_PORT: 18080
+      CODEX_AS_API_MODEL: ${CODEX_AS_API_MODEL:-gpt-5.5}
+      CODEX_AS_API_API_KEY: ${CODEX_AS_API_API_KEY:-}
+      CODEX_AS_API_AUTH_PATH: /codex-home/auth.json
+      CODEX_AS_API_WORKERS: ${CODEX_AS_API_WORKERS:-2}
+      CODEX_AS_API_WORKER_TIMEOUT: ${CODEX_AS_API_WORKER_TIMEOUT:-0}
+      CODEX_AS_API_GRACEFUL_TIMEOUT: ${CODEX_AS_API_GRACEFUL_TIMEOUT:-30}
+      CODEX_AS_API_KEEP_ALIVE: ${CODEX_AS_API_KEEP_ALIVE:-5}
+    volumes:
+      - ${CODEX_HOME_VOLUME:-codex-home}:/codex-home
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18080/health', timeout=3).read()",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  codex-login:
+    build:
+      context: .
+      args:
+        CODEX_CLI_VERSION: ${CODEX_CLI_VERSION:-0.129.0}
+    image: codex-as-api:local
+    profiles:
+      - login
+    environment:
+      CODEX_HOME: /codex-home
+    volumes:
+      - ${CODEX_HOME_VOLUME:-codex-home}:/codex-home
+    stdin_open: true
+    tty: true
+    command: codex login
+
+volumes:
+  codex-home:

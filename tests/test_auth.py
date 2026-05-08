@@ -16,6 +16,7 @@ from codex_as_api.auth import (
     load_token_data,
     redact_text,
     register_token_secrets,
+    refresh_token,
     resolve_auth_path,
 )
 
@@ -275,3 +276,20 @@ def test_is_auth_locally_available_false_invalid_json(tmp_path):
 
 def test_register_token_secrets_is_noop():
     register_token_secrets("tok1", "tok2", None)
+
+
+# ---------------------------------------------------------------------------
+# refresh_token
+# ---------------------------------------------------------------------------
+
+
+def test_refresh_token_skips_network_when_another_process_refreshed(auth_json_factory, monkeypatch):
+    path = auth_json_factory()
+
+    def fail_urlopen(*_args, **_kwargs):
+        pytest.fail("refresh_token should not call the network when access token already changed")
+
+    monkeypatch.setattr("urllib.request.urlopen", fail_urlopen)
+    data = refresh_token(str(path), stale_access_token="stale-token")
+    assert data.auth_path == path
+    assert data.access_token != "stale-token"

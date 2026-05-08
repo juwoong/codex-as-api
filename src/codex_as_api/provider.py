@@ -477,7 +477,7 @@ class ChatGPTOAuthProvider:
                 body = exc.read().decode("utf-8", "replace")
                 redacted = redact_text(body, *token_values)
                 if exc.code == 401 and attempt == 0:
-                    refresh_token(self.auth_json_path)
+                    refresh_token(self.auth_json_path, stale_access_token=token.access_token)
                     continue
                 raise ChatGPTOAuthError(f"ChatGPT OAuth request failed: HTTP {exc.code}: {redacted}") from exc
             except Exception as exc:  # noqa: BLE001
@@ -503,7 +503,7 @@ class ChatGPTOAuthProvider:
                 body = exc.read().decode("utf-8", "replace")
                 redacted = redact_text(body, *token_values)
                 if exc.code == 401 and attempt == 0:
-                    refresh_token(self.auth_json_path)
+                    refresh_token(self.auth_json_path, stale_access_token=token.access_token)
                     continue
                 raise ChatGPTOAuthError(f"ChatGPT OAuth request failed: HTTP {exc.code}: {redacted}") from exc
             except Exception as exc:  # noqa: BLE001

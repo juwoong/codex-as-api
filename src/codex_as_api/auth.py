@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from contextlib import contextmanager
 import dataclasses
 import datetime as _dt
 import json
@@ -9,7 +10,12 @@ import pathlib
 import threading
 import urllib.error
 import urllib.request
-from typing import Any
+from typing import Any, Iterator
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback for library users.
+    fcntl = None  # type: ignore[assignment]
 
 CHATGPT_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 DEFAULT_AUTH_PATH = "~/.codex/auth.json"
@@ -172,6 +178,23 @@ def _refresh_lock(path: pathlib.Path) -> threading.Lock:
         return lock
 
 
+@contextmanager
+def _refresh_file_lock(path: pathlib.Path) -> Iterator[None]:
+    lock_path = path.expanduser().with_name(f".{path.name}.refresh.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        if fcntl is not None:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
 def _write_auth_json(path: pathlib.Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}-{threading.get_ident()}")
@@ -196,44 +219,51 @@ def _write_auth_json(path: pathlib.Path, data: dict[str, Any]) -> None:
             pass
 
 
-def refresh_token(auth_json_path: str | pathlib.Path | None = None) -> ChatGPTTokenData:
+def refresh_token(
+    auth_json_path: str | pathlib.Path | None = None,
+    *,
+    stale_access_token: str | None = None,
+) -> ChatGPTTokenData:
     current = load_token_data(auth_json_path)
     lock = _refresh_lock(current.auth_path)
     with lock:
-        current = load_token_data(auth_json_path)
-        endpoint = os.getenv(REFRESH_URL_OVERRIDE_ENV, DEFAULT_REFRESH_URL)
-        body = json.dumps({
-            "client_id": CHATGPT_OAUTH_CLIENT_ID,
-            "grant_type": "refresh_token",
-            "refresh_token": current.refresh_token,
-        }).encode()
-        request = urllib.request.Request(
-            endpoint,
-            data=body,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=30) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            text = exc.read().decode("utf-8", "replace")
-            redacted = redact_text(text, current.access_token, current.refresh_token, current.id_token)
-            if exc.code == 401:
-                raise ChatGPTOAuthRefreshError(f"ChatGPT OAuth refresh token is invalid; rerun codex login: {redacted}") from exc
-            raise ChatGPTOAuthRefreshError(f"ChatGPT OAuth token refresh failed: HTTP {exc.code}: {redacted}") from exc
-        except Exception as exc:  # noqa: BLE001
-            raise ChatGPTOAuthRefreshError(f"ChatGPT OAuth token refresh failed: {exc}") from exc
-        if not isinstance(payload, dict):
-            raise ChatGPTOAuthRefreshError("ChatGPT OAuth token refresh returned invalid JSON")
-        data = json.loads(current.auth_path.read_text(encoding="utf-8"))
-        tokens = data.setdefault("tokens", {})
-        if payload.get("id_token"):
-            tokens["id_token"] = payload["id_token"]
-        if payload.get("access_token"):
-            tokens["access_token"] = payload["access_token"]
-        if payload.get("refresh_token"):
-            tokens["refresh_token"] = payload["refresh_token"]
-        data["last_refresh"] = _dt.datetime.now(_dt.UTC).isoformat().replace("+00:00", "Z")
-        _write_auth_json(current.auth_path, data)
-        return load_token_data(auth_json_path)
+        with _refresh_file_lock(current.auth_path):
+            current = load_token_data(auth_json_path)
+            if stale_access_token is not None and current.access_token != stale_access_token:
+                return current
+            endpoint = os.getenv(REFRESH_URL_OVERRIDE_ENV, DEFAULT_REFRESH_URL)
+            body = json.dumps({
+                "client_id": CHATGPT_OAUTH_CLIENT_ID,
+                "grant_type": "refresh_token",
+                "refresh_token": current.refresh_token,
+            }).encode()
+            request = urllib.request.Request(
+                endpoint,
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                text = exc.read().decode("utf-8", "replace")
+                redacted = redact_text(text, current.access_token, current.refresh_token, current.id_token)
+                if exc.code == 401:
+                    raise ChatGPTOAuthRefreshError(f"ChatGPT OAuth refresh token is invalid; rerun codex login: {redacted}") from exc
+                raise ChatGPTOAuthRefreshError(f"ChatGPT OAuth token refresh failed: HTTP {exc.code}: {redacted}") from exc
+            except Exception as exc:  # noqa: BLE001
+                raise ChatGPTOAuthRefreshError(f"ChatGPT OAuth token refresh failed: {exc}") from exc
+            if not isinstance(payload, dict):
+                raise ChatGPTOAuthRefreshError("ChatGPT OAuth token refresh returned invalid JSON")
+            data = json.loads(current.auth_path.read_text(encoding="utf-8"))
+            tokens = data.setdefault("tokens", {})
+            if payload.get("id_token"):
+                tokens["id_token"] = payload["id_token"]
+            if payload.get("access_token"):
+                tokens["access_token"] = payload["access_token"]
+            if payload.get("refresh_token"):
+                tokens["refresh_token"] = payload["refresh_token"]
+            data["last_refresh"] = _dt.datetime.now(_dt.UTC).isoformat().replace("+00:00", "Z")
+            _write_auth_json(current.auth_path, data)
+            return load_token_data(auth_json_path)

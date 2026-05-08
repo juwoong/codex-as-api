@@ -19,6 +19,15 @@ def client():
 # ---------------------------------------------------------------------------
 
 
+def test_root_returns_auth_status(client):
+    resp = client.get("/")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["service"] == "codex-as-api"
+    assert "auth_available" in body
+    assert "auth_status" in body
+
+
 def test_health_returns_ok(client):
     resp = client.get("/health")
     assert resp.status_code == 200
@@ -26,6 +35,73 @@ def test_health_returns_ok(client):
     assert body["status"] == "ok"
     assert "auth_available" in body
     assert "model" in body
+
+
+# ---------------------------------------------------------------------------
+# API auth
+# ---------------------------------------------------------------------------
+
+
+def test_authorization_token_accepts_bearer_and_raw():
+    from codex_as_api.server import _authorization_token
+    assert _authorization_token("Bearer test-key") == "test-key"
+    assert _authorization_token("test-key") == "test-key"
+    assert _authorization_token(None) == ""
+
+
+def test_chat_completions_missing_api_key_returns_401(tmp_path):
+    import codex_as_api.server as server_mod
+    old_api_key = server_mod.API_KEY
+    old_auth_path = server_mod.AUTH_PATH
+    server_mod.API_KEY = "secret-key"
+    server_mod.AUTH_PATH = str(tmp_path / "nonexistent.json")
+    server_mod._provider = None
+    try:
+        from codex_as_api.server import app
+        from fastapi.testclient import TestClient
+        c = TestClient(app, raise_server_exceptions=False)
+        payload = {
+            "model": "gpt-5.5",
+            "messages": [
+                {"role": "system", "content": "You are helpful."},
+                {"role": "user", "content": "Hello"},
+            ],
+        }
+        resp = c.post("/v1/chat/completions", json=payload)
+        assert resp.status_code == 401
+        assert resp.headers["www-authenticate"] == "Bearer"
+        assert resp.json()["error"]["type"] == "api_auth_error"
+    finally:
+        server_mod.API_KEY = old_api_key
+        server_mod.AUTH_PATH = old_auth_path
+        server_mod._provider = None
+
+
+def test_chat_completions_valid_api_key_continues_to_oauth_check(tmp_path):
+    import codex_as_api.server as server_mod
+    old_api_key = server_mod.API_KEY
+    old_auth_path = server_mod.AUTH_PATH
+    server_mod.API_KEY = "secret-key"
+    server_mod.AUTH_PATH = str(tmp_path / "nonexistent.json")
+    server_mod._provider = None
+    try:
+        from codex_as_api.server import app
+        from fastapi.testclient import TestClient
+        c = TestClient(app, raise_server_exceptions=False)
+        payload = {
+            "model": "gpt-5.5",
+            "messages": [
+                {"role": "system", "content": "You are helpful."},
+                {"role": "user", "content": "Hello"},
+            ],
+        }
+        resp = c.post("/v1/chat/completions", headers={"Authorization": "Bearer secret-key"}, json=payload)
+        assert resp.status_code == 401
+        assert resp.json()["error"]["type"] == "chatgpt_oauth_error"
+    finally:
+        server_mod.API_KEY = old_api_key
+        server_mod.AUTH_PATH = old_auth_path
+        server_mod._provider = None
 
 
 # ---------------------------------------------------------------------------
@@ -122,23 +198,52 @@ def test_chat_completions_all_extended_fields_accepted(client):
 
 def test_chat_completions_missing_auth_returns_auth_error(tmp_path, monkeypatch):
     monkeypatch.setenv("CODEX_AS_API_AUTH_PATH", str(tmp_path / "nonexistent.json"))
-    import importlib
     import codex_as_api.server as server_mod
+    old_auth_path = server_mod.AUTH_PATH
     server_mod.AUTH_PATH = str(tmp_path / "nonexistent.json")
     server_mod._provider = None
-    from codex_as_api.server import app
-    from fastapi.testclient import TestClient
-    c = TestClient(app, raise_server_exceptions=False)
-    payload = {
-        "model": "gpt-5.5",
-        "messages": [
-            {"role": "system", "content": "You are helpful."},
-            {"role": "user", "content": "Hello"},
-        ],
-    }
-    resp = c.post("/v1/chat/completions", json=payload)
-    assert resp.status_code in (401, 500)
-    body = resp.json()
-    assert "error" in body
-    assert body["error"]["type"] == "chatgpt_oauth_error"
+    try:
+        from codex_as_api.server import app
+        from fastapi.testclient import TestClient
+        c = TestClient(app, raise_server_exceptions=False)
+        payload = {
+            "model": "gpt-5.5",
+            "messages": [
+                {"role": "system", "content": "You are helpful."},
+                {"role": "user", "content": "Hello"},
+            ],
+        }
+        resp = c.post("/v1/chat/completions", json=payload)
+        assert resp.status_code == 401
+        body = resp.json()
+        assert "error" in body
+        assert body["error"]["type"] == "chatgpt_oauth_error"
+    finally:
+        server_mod.AUTH_PATH = old_auth_path
+        server_mod._provider = None
+
+
+def test_chat_completions_stream_missing_auth_returns_401_before_streaming(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_AS_API_AUTH_PATH", str(tmp_path / "nonexistent.json"))
+    import codex_as_api.server as server_mod
+    old_auth_path = server_mod.AUTH_PATH
+    server_mod.AUTH_PATH = str(tmp_path / "nonexistent.json")
     server_mod._provider = None
+    try:
+        from codex_as_api.server import app
+        from fastapi.testclient import TestClient
+        c = TestClient(app, raise_server_exceptions=False)
+        payload = {
+            "model": "gpt-5.5",
+            "stream": True,
+            "messages": [
+                {"role": "system", "content": "You are helpful."},
+                {"role": "user", "content": "Hello"},
+            ],
+        }
+        resp = c.post("/v1/chat/completions", json=payload)
+        assert resp.status_code == 401
+        assert resp.headers["content-type"].startswith("application/json")
+    finally:
+        server_mod.AUTH_PATH = old_auth_path
+        server_mod._provider = None

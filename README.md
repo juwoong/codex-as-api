@@ -117,6 +117,79 @@ app.listen(18080);
 
 All versions bind to `127.0.0.1:18080` (localhost only) by default.
 
+### Docker
+
+The Docker image includes the Codex CLI (`@openai/codex`), runs the FastAPI app
+under Gunicorn with multiple Uvicorn workers, and keeps Codex OAuth credentials
+outside the image.
+
+You can pin the Codex CLI package at build time:
+
+```bash
+docker build --build-arg CODEX_CLI_VERSION=0.129.0 -t codex-as-api:local .
+```
+
+First, log in once on the VM into the persistent Docker volume:
+
+```bash
+docker compose --profile login run --rm codex-login
+```
+
+Then build and run the API server:
+
+```bash
+docker compose up -d --build codex-as-api
+```
+
+By default, the login container writes `auth.json` to `/codex-home/auth.json`,
+which is stored in the Docker named volume `codex-home` and mounted into the API
+container at the same path. Rebuilding or redeploying the service does not
+require a new login as long as the volume is kept. Do not run
+`docker compose down -v` unless you intentionally want to delete the saved login.
+
+To use a fixed VM directory instead of a Docker named volume:
+
+```bash
+sudo mkdir -p /srv/codex-as-api/codex-home
+sudo chown "$USER":"$USER" /srv/codex-as-api/codex-home
+CODEX_HOME=/srv/codex-as-api/codex-home codex login
+CODEX_HOME_VOLUME=/srv/codex-as-api/codex-home docker compose up -d --build codex-as-api
+```
+
+Gunicorn worker count is controlled with `CODEX_AS_API_WORKERS`:
+
+```bash
+CODEX_AS_API_WORKERS=4 docker compose up -d --build codex-as-api
+```
+
+#### Railway
+
+Railway does not use the Compose-only `codex-login` service. Instead, attach a
+Railway volume mounted at `/codex-home` and deploy the Dockerfile normally. The
+image already has `codex` installed, and `CODEX_HOME` defaults to `/codex-home`.
+
+On the first deploy, `GET /` and `GET /health` will show
+`"auth_status": "required"`, and API endpoints return `401` until credentials
+exist. Open a shell in the running Railway service and run:
+
+```bash
+codex login
+```
+
+That writes `/codex-home/auth.json` into the persistent Railway volume. The API
+starts working immediately after login, and later deploys keep using the same
+saved credentials as long as the volume is kept. Railway's `PORT` environment
+variable is honored automatically by the Docker command.
+
+For a public deployment, set `CODEX_AS_API_API_KEY` and send it as a bearer token:
+
+```bash
+curl https://your-service.example/v1/chat/completions \
+  -H "Authorization: Bearer $CODEX_AS_API_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-5.5","messages":[{"role":"system","content":"You are helpful."},{"role":"user","content":"Hello"}]}'
+```
+
 ## Configuration
 
 Environment variables (Python, Rust, and TypeScript):
@@ -127,6 +200,7 @@ Environment variables (Python, Rust, and TypeScript):
 | `CODEX_AS_API_PORT` | `18080` | Listen port |
 | `CODEX_AS_API_MODEL` | `gpt-5.5` | Model identifier passed to Codex backend |
 | `CODEX_AS_API_AUTH_PATH` | `~/.codex/auth.json` | Path to OAuth credentials file |
+| `CODEX_AS_API_API_KEY` | unset | Optional fixed bearer token required for `/v1` API calls |
 
 ### Supported Models
 

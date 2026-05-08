@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import os
 import time
@@ -8,7 +9,13 @@ import uuid
 from collections.abc import AsyncIterator
 from typing import Any
 
-from .auth import ChatGPTOAuthError, ChatGPTOAuthMissingError, is_auth_locally_available
+from .auth import (
+    ChatGPTOAuthError,
+    ChatGPTOAuthMissingError,
+    is_auth_locally_available,
+    load_token_data,
+    resolve_auth_path,
+)
 from .messages import Message, MessageRole, ToolSchema
 from .provider import ChatGPTOAuthProvider
 
@@ -28,8 +35,13 @@ HOST = _env_str("CODEX_AS_API_HOST", "127.0.0.1")
 PORT = _env_int("CODEX_AS_API_PORT", 18080)
 MODEL = _env_str("CODEX_AS_API_MODEL", "gpt-5.5")
 AUTH_PATH = os.getenv("CODEX_AS_API_AUTH_PATH")
+API_KEY = os.getenv("CODEX_AS_API_API_KEY")
 
 _provider: ChatGPTOAuthProvider | None = None
+
+
+class APIAuthError(RuntimeError):
+    pass
 
 
 def _get_provider() -> ChatGPTOAuthProvider:
@@ -40,6 +52,46 @@ def _get_provider() -> ChatGPTOAuthProvider:
             auth_json_path=AUTH_PATH,
         )
     return _provider
+
+
+def _auth_status() -> dict[str, Any]:
+    auth_available = is_auth_locally_available(AUTH_PATH)
+    result: dict[str, Any] = {
+        "auth_available": auth_available,
+        "auth_path": str(resolve_auth_path(AUTH_PATH)),
+    }
+    if not auth_available:
+        result["auth_status"] = "required"
+        result["auth_hint"] = "Run `codex login` with CODEX_HOME pointing at the persistent auth volume."
+    else:
+        result["auth_status"] = "ready"
+    return result
+
+
+def _api_auth_status() -> dict[str, Any]:
+    return {"api_auth_enabled": bool(API_KEY)}
+
+
+def _authorization_token(value: str | None) -> str:
+    if value is None:
+        return ""
+    stripped = value.strip()
+    if stripped.lower().startswith("bearer "):
+        return stripped[7:].strip()
+    return stripped
+
+
+def _require_api_key(request: Any) -> None:
+    expected = API_KEY.strip() if API_KEY else ""
+    if not expected:
+        return
+    provided = _authorization_token(request.headers.get("authorization"))
+    if not provided or not hmac.compare_digest(provided, expected):
+        raise APIAuthError("Invalid or missing API key")
+
+
+def _require_auth() -> None:
+    load_token_data(AUTH_PATH)
 
 
 # FastAPI is an optional dependency; fail gracefully if missing.
@@ -58,6 +110,14 @@ try:
     async def _chatgpt_oauth_error_handler(_request: Request, exc: ChatGPTOAuthError) -> JSONResponse:
         status = 401 if isinstance(exc, ChatGPTOAuthMissingError) else 500
         return JSONResponse(status_code=status, content={"error": {"message": str(exc), "type": "chatgpt_oauth_error"}})
+
+    @app.exception_handler(APIAuthError)
+    async def _api_auth_error_handler(_request: Request, exc: APIAuthError) -> JSONResponse:
+        return JSONResponse(
+            status_code=401,
+            headers={"WWW-Authenticate": "Bearer"},
+            content={"error": {"message": str(exc), "type": "api_auth_error"}},
+        )
 
     # ------------------------------------------------------------------
     # Request/response schemas
@@ -203,16 +263,29 @@ try:
     # Endpoints
     # ------------------------------------------------------------------
 
+    @app.get("/")
+    async def root() -> dict[str, Any]:
+        return {
+            "service": "codex-as-api",
+            "status": "ok",
+            "model": MODEL,
+            **_auth_status(),
+            **_api_auth_status(),
+        }
+
     @app.get("/health")
     async def health() -> dict[str, Any]:
         return {
             "status": "ok",
-            "auth_available": is_auth_locally_available(AUTH_PATH),
             "model": MODEL,
+            **_auth_status(),
+            **_api_auth_status(),
         }
 
     @app.post("/v1/chat/completions", response_model=None)
     async def chat_completions(request: ChatCompletionRequest, http_request: Request) -> JSONResponse | StreamingResponse:
+        _require_api_key(http_request)
+        _require_auth()
         provider = _get_provider()
         messages = _request_messages_to_internal(request.messages)
         tools = _parse_tools(request.tools)
@@ -437,7 +510,9 @@ try:
         return JSONResponse(content=result)
 
     @app.post("/v1/images/generations")
-    async def images_generations(request: ImageGenerationRequest) -> JSONResponse:
+    async def images_generations(request: ImageGenerationRequest, http_request: Request) -> JSONResponse:
+        _require_api_key(http_request)
+        _require_auth()
         provider = _get_provider()
         images = provider.generate_image(
             request.prompt,
@@ -468,6 +543,8 @@ try:
 
     @app.post("/v1/messages", response_model=None)
     async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingResponse:
+        _require_api_key(http_request)
+        _require_auth()
         provider = _get_provider()
         body = await http_request.json()
 
@@ -539,6 +616,8 @@ try:
 
         Body: {"prompt": str, "images": [{"image_url": "data:image/..."}, ...], "reasoning_effort": str?}
         """
+        _require_api_key(request)
+        _require_auth()
         provider = _get_provider()
         body = await request.json()
         prompt = str(body.get("prompt", ""))
@@ -553,6 +632,8 @@ try:
 
         Body: {"messages": [{"role": "system|user|assistant|tool", "content": str, ...}], "reasoning_effort": str?}
         """
+        _require_api_key(request)
+        _require_auth()
         provider = _get_provider()
         body = await request.json()
         raw_messages = body.get("messages") or []
