@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 
 import pytest
 
@@ -35,6 +36,16 @@ def test_health_returns_ok(client):
     assert body["status"] == "ok"
     assert "auth_available" in body
     assert "model" in body
+
+
+def test_request_timing_log_includes_duration_ms(client, caplog):
+    caplog.set_level(logging.INFO, logger="codex_as_api.request")
+    resp = client.get("/health")
+    assert resp.status_code == 200
+
+    messages = [record.getMessage() for record in caplog.records if record.name == "codex_as_api.request"]
+    assert any("method=GET" in message and "path=/health" in message for message in messages)
+    assert any("duration_ms=" in message for message in messages)
 
 
 # ---------------------------------------------------------------------------

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import json
+import logging
 import os
 import time
 import uuid
@@ -38,6 +39,7 @@ AUTH_PATH = os.getenv("CODEX_AS_API_AUTH_PATH")
 API_KEY = os.getenv("CODEX_AS_API_API_KEY")
 
 _provider: ChatGPTOAuthProvider | None = None
+_request_logger = logging.getLogger("codex_as_api.request")
 
 
 class APIAuthError(RuntimeError):
@@ -105,6 +107,55 @@ try:
         description="Local OpenAI-compatible API server backed by ChatGPT/Codex OAuth.",
         version="0.1.0",
     )
+
+    class RequestTimingMiddleware:
+        def __init__(self, app: Any) -> None:
+            self.app = app
+
+        async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+            if scope.get("type") != "http":
+                await self.app(scope, receive, send)
+                return
+
+            started_at = time.perf_counter()
+            method = str(scope.get("method") or "")
+            path = str(scope.get("path") or "")
+            client = scope.get("client")
+            client_host = client[0] if isinstance(client, tuple) and client else "-"
+            status_code: int | None = None
+            logged = False
+
+            def log_request(status: int | str, *, error: bool = False) -> None:
+                nonlocal logged
+                if logged:
+                    return
+                logged = True
+                duration_ms = (time.perf_counter() - started_at) * 1000
+                _request_logger.info(
+                    "request method=%s path=%s status=%s duration_ms=%.2f client=%s error=%s",
+                    method,
+                    path,
+                    status,
+                    duration_ms,
+                    client_host,
+                    str(error).lower(),
+                )
+
+            async def send_with_timing(message: dict[str, Any]) -> None:
+                nonlocal status_code
+                if message.get("type") == "http.response.start":
+                    status_code = int(message.get("status") or 0)
+                await send(message)
+                if message.get("type") == "http.response.body" and not message.get("more_body", False):
+                    log_request(status_code or "-")
+
+            try:
+                await self.app(scope, receive, send_with_timing)
+            except Exception:
+                log_request(status_code or 500, error=True)
+                raise
+
+    app.add_middleware(RequestTimingMiddleware)
 
     @app.exception_handler(ChatGPTOAuthError)
     async def _chatgpt_oauth_error_handler(_request: Request, exc: ChatGPTOAuthError) -> JSONResponse:
