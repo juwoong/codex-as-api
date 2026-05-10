@@ -39,7 +39,7 @@ AUTH_PATH = os.getenv("CODEX_AS_API_AUTH_PATH")
 API_KEY = os.getenv("CODEX_AS_API_API_KEY")
 
 _provider: ChatGPTOAuthProvider | None = None
-_request_logger = logging.getLogger("codex_as_api.request")
+_request_logger = logging.getLogger("gunicorn.error")
 
 
 class APIAuthError(RuntimeError):

@@ -39,11 +39,11 @@ def test_health_returns_ok(client):
 
 
 def test_request_timing_log_includes_duration_ms(client, caplog):
-    caplog.set_level(logging.INFO, logger="codex_as_api.request")
+    caplog.set_level(logging.INFO, logger="gunicorn.error")
     resp = client.get("/health")
     assert resp.status_code == 200
 
-    messages = [record.getMessage() for record in caplog.records if record.name == "codex_as_api.request"]
+    messages = [record.getMessage() for record in caplog.records if record.name == "gunicorn.error"]
     assert any("method=GET" in message and "path=/health" in message for message in messages)
     assert any("duration_ms=" in message for message in messages)
 
