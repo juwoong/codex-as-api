@@ -7,6 +7,8 @@
 
 Use ChatGPT / Codex OAuth as a local OpenAI-compatible API server.
 
+<!-- Deployment smoke-test marker. -->
+
 ## Features
 
 - **OpenAI & Anthropic compatible** — `POST /v1/chat/completions` and `POST /v1/messages` endpoints
