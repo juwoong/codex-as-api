@@ -14,6 +14,7 @@ Use ChatGPT / Codex OAuth as a local OpenAI-compatible API server.
 - **Streaming** — full SSE streaming for both OpenAI and Anthropic protocols
 - **Tool calling** — function calls, tool results, and parallel tool calls
 - **Image support** — generation, inspection, and base64 image passthrough (including tool result images)
+- **Multipart file summarization** — `POST /v1/files/summarize` accepts text, image, and PDF uploads in the Python/FastAPI server
 - **Reasoning** — configurable reasoning effort with streaming thinking content
 - **Codex features** — `prompt_cache_key`, `previous_response_id`, subagent headers, remote compaction
 - **Auto auth** — reads `~/.codex/auth.json` and auto-refreshes OAuth tokens
@@ -359,6 +360,50 @@ curl http://localhost:18080/v1/images/generations \
     "prompt": "a futuristic city at sunset",
     "size": "1024x1024"
   }'
+```
+
+### `POST /v1/files/summarize`
+
+Summarize multiple uploaded files as one integrated summary. This multipart endpoint is implemented in the Python/FastAPI server used by the Docker deployment.
+
+Files are not stored. They are read during request handling, converted to model input content items, and discarded after the request. The optional `context` field is metadata/background for the entire file bundle, not a summarization instruction.
+
+Request fields:
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `model` | yes | Codex model name, for example `gpt-5.5` |
+| `context` | no | Metadata/background for all uploaded files |
+| `files` | yes | One or more uploaded files |
+| `reasoning_effort` | no | Optional reasoning effort |
+
+Supported uploads are UTF-8 text files, images, and PDFs. PDFs are sent to OpenAI Responses as `input_file` content items with `filename` and base64 `file_data`, following the [OpenAI file input guide](https://platform.openai.com/docs/guides/pdf-files). Default limits are 10 files per request and 10 MB per file.
+
+Response:
+
+```json
+{
+  "summary": "summary text",
+  "model": "codex-oauth:gpt-5.5",
+  "files": [
+    {
+      "filename": "ledger.pdf",
+      "content_type": "application/pdf",
+      "size_bytes": 12345,
+      "kind": "pdf"
+    }
+  ]
+}
+```
+
+```bash
+curl http://localhost:18080/v1/files/summarize \
+  -H "Authorization: Bearer $CODEX_AS_API_API_KEY" \
+  -F "model=gpt-5.5" \
+  -F "context=2026년 5월 ABC업체와의 거래 장부 내역" \
+  -F "files=@ledger.pdf" \
+  -F "files=@receipt.png" \
+  -F "files=@memo.txt"
 ```
 
 ### `POST /v1/inspect`

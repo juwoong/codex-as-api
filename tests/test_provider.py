@@ -7,7 +7,9 @@ import pytest
 from codex_as_api.auth import ChatGPTOAuthError
 from codex_as_api.messages import Message, MessageRole, ToolCall, ToolSchema
 from codex_as_api.provider import (
+    FILE_SUMMARY_INSTRUCTIONS,
     REMOTE_COMPACTION_MARKER,
+    ChatGPTOAuthProvider,
     _decode_sse_block,
     _image_generation_from_item,
     _message_item,
@@ -18,9 +20,9 @@ from codex_as_api.provider import (
     _tool_call_from_response_item,
     _tool_schema_to_response_dict,
     _usage_from_response,
+    _validate_file_summary_content_items,
     _validate_image_content_items,
 )
-
 
 # ---------------------------------------------------------------------------
 # _set_reasoning_payload
@@ -364,6 +366,59 @@ def test_validate_image_content_items_non_data_url_raises():
 
 def test_validate_image_content_items_empty_list():
     assert _validate_image_content_items([]) == []
+
+
+# ---------------------------------------------------------------------------
+# File summarization
+# ---------------------------------------------------------------------------
+
+
+def test_validate_file_summary_content_items_accepts_text_image_and_pdf():
+    content = [
+        {"type": "input_text", "text": "context"},
+        {"type": "input_image", "image_url": "data:image/png;base64,abc"},
+        {
+            "type": "input_file",
+            "filename": "ledger.pdf",
+            "file_data": "data:application/pdf;base64,abc",
+        },
+    ]
+    assert _validate_file_summary_content_items(content) == content
+
+
+def test_validate_file_summary_content_items_rejects_unsupported_type():
+    with pytest.raises(ChatGPTOAuthError, match="unsupported file summary content item type"):
+        _validate_file_summary_content_items([{"type": "audio", "data": "abc"}])
+
+
+def test_summarize_files_builds_responses_payload():
+    class CapturingProvider(ChatGPTOAuthProvider):
+        def __init__(self):
+            super().__init__(model="default-model", auth_json_path="unused")
+            self.payload = None
+
+        def _collect_response_output_items(self, payload):
+            self.payload = payload
+            return [{"type": "output_text", "text": " summary text "}]
+
+    provider = CapturingProvider()
+    content = [
+        {"type": "input_text", "text": "Context metadata:\nMay ledger"},
+        {"type": "input_file", "filename": "ledger.pdf", "file_data": "data:application/pdf;base64,abc"},
+    ]
+
+    summary = provider.summarize_files(content, model="gpt-5.5", reasoning_effort="low")
+
+    assert summary == "summary text"
+    assert provider.payload is not None
+    assert provider.payload["model"] == "gpt-5.5"
+    assert provider.payload["instructions"] == FILE_SUMMARY_INSTRUCTIONS
+    assert "background metadata" in provider.payload["instructions"]
+    assert provider.payload["input"] == [{"type": "message", "role": "user", "content": content}]
+    assert provider.payload["tools"] == []
+    assert provider.payload["stream"] is True
+    assert provider.payload["store"] is False
+    assert provider.payload["reasoning"] == {"effort": "low"}
 
 
 # ---------------------------------------------------------------------------

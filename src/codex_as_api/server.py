@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import asyncio
+import base64
 import hmac
 import json
 import logging
+import mimetypes
 import os
 import time
 import uuid
@@ -37,6 +38,51 @@ PORT = _env_int("CODEX_AS_API_PORT", 18080)
 MODEL = _env_str("CODEX_AS_API_MODEL", "gpt-5.5")
 AUTH_PATH = os.getenv("CODEX_AS_API_AUTH_PATH")
 API_KEY = os.getenv("CODEX_AS_API_API_KEY")
+MAX_SUMMARY_FILES = 10
+MAX_SUMMARY_FILE_BYTES = 10 * 1024 * 1024
+SUMMARY_TEXT_MIME_TYPES = frozenset({
+    "application/csv",
+    "application/javascript",
+    "application/json",
+    "application/ld+json",
+    "application/sql",
+    "application/toml",
+    "application/typescript",
+    "application/x-ndjson",
+    "application/x-sh",
+    "application/x-yaml",
+    "application/xml",
+    "application/yaml",
+})
+SUMMARY_TEXT_EXTENSIONS = frozenset({
+    ".cfg",
+    ".conf",
+    ".css",
+    ".csv",
+    ".env",
+    ".htm",
+    ".html",
+    ".ini",
+    ".js",
+    ".json",
+    ".jsonl",
+    ".jsx",
+    ".log",
+    ".md",
+    ".markdown",
+    ".py",
+    ".rst",
+    ".sql",
+    ".text",
+    ".toml",
+    ".ts",
+    ".tsx",
+    ".tsv",
+    ".txt",
+    ".xml",
+    ".yaml",
+    ".yml",
+})
 
 _provider: ChatGPTOAuthProvider | None = None
 _request_logger = logging.getLogger("gunicorn.error")
@@ -98,9 +144,10 @@ def _require_auth() -> None:
 
 # FastAPI is an optional dependency; fail gracefully if missing.
 try:
-    from fastapi import FastAPI, Request
+    from fastapi import FastAPI, HTTPException, Request, UploadFile
     from fastapi.responses import JSONResponse, StreamingResponse
-    from pydantic import BaseModel, Field
+    from pydantic import BaseModel
+    from starlette.datastructures import FormData, UploadFile as StarletteUploadFile
 
     app = FastAPI(
         title="codex-as-api",
@@ -295,7 +342,13 @@ try:
             desc = func.get("description") or ""
             params = func.get("parameters") or {}
             if name:
-                schemas.append(ToolSchema(name=str(name), description=str(desc), parameters=params if isinstance(params, dict) else {}))
+                schemas.append(
+                    ToolSchema(
+                        name=str(name),
+                        description=str(desc),
+                        parameters=params if isinstance(params, dict) else {},
+                    )
+                )
         return schemas if schemas else None
 
     def _normalize_stop(stop: str | list[str] | None) -> list[str] | None:
@@ -309,6 +362,139 @@ try:
         if req.max_completion_tokens is not None:
             return req.max_completion_tokens
         return req.max_tokens
+
+    def _safe_upload_filename(upload: UploadFile, index: int) -> str:
+        raw = (upload.filename or "").strip().replace("\\", "/")
+        name = raw.rsplit("/", 1)[-1].strip()
+        return name or f"file-{index}"
+
+    def _summary_context_content_item(context: str | None) -> dict[str, str]:
+        metadata = context.strip() if isinstance(context, str) and context.strip() else "(none provided)"
+        return {
+            "type": "input_text",
+            "text": (
+                "Create one integrated summary of the attached files.\n"
+                "The context below is user-provided metadata for the entire file bundle, not a summary instruction.\n\n"
+                f"Context metadata:\n{metadata}"
+            ),
+        }
+
+    def _summary_file_kind(filename: str, content_type: str | None) -> tuple[str | None, str]:
+        guessed_type = mimetypes.guess_type(filename)[0]
+        normalized = (content_type or guessed_type or "application/octet-stream").split(";", 1)[0].strip().lower()
+        if normalized == "application/octet-stream" and guessed_type:
+            normalized = guessed_type.lower()
+        ext = os.path.splitext(filename.lower())[1]
+        if normalized == "application/pdf" or ext == ".pdf":
+            return "pdf", "application/pdf"
+        if normalized.startswith("image/"):
+            return "image", normalized
+        is_text = (
+            normalized.startswith("text/")
+            or normalized in SUMMARY_TEXT_MIME_TYPES
+            or ext in SUMMARY_TEXT_EXTENSIONS
+        )
+        if is_text:
+            if normalized == "application/octet-stream":
+                normalized = "text/plain"
+            return "text", normalized
+        return None, normalized or "application/octet-stream"
+
+    async def _read_summary_upload(upload: UploadFile, filename: str) -> bytes:
+        try:
+            data = await upload.read(MAX_SUMMARY_FILE_BYTES + 1)
+        finally:
+            await upload.close()
+        if len(data) > MAX_SUMMARY_FILE_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"file '{filename}' exceeds the {MAX_SUMMARY_FILE_BYTES} byte limit",
+            )
+        return data
+
+    async def _summary_content_from_uploads(
+        files: list[UploadFile | StarletteUploadFile],
+        context: str | None,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        if not files:
+            raise HTTPException(status_code=400, detail="at least one file is required")
+        if len(files) > MAX_SUMMARY_FILES:
+            raise HTTPException(status_code=400, detail=f"at most {MAX_SUMMARY_FILES} files are allowed")
+
+        content_items: list[dict[str, Any]] = [_summary_context_content_item(context)]
+        file_metadata: list[dict[str, Any]] = []
+
+        for index, upload in enumerate(files, start=1):
+            filename = _safe_upload_filename(upload, index)
+            kind, content_type = _summary_file_kind(filename, upload.content_type)
+            if kind is None:
+                raise HTTPException(
+                    status_code=415,
+                    detail=f"unsupported file type for '{filename}': {content_type}",
+                )
+
+            data = await _read_summary_upload(upload, filename)
+            size_bytes = len(data)
+            file_metadata.append({
+                "filename": filename,
+                "content_type": content_type,
+                "size_bytes": size_bytes,
+                "kind": kind,
+            })
+
+            file_label = (
+                f"File {index}: {filename}\n"
+                f"Kind: {kind}\n"
+                f"Content-Type: {content_type}\n"
+                f"Size: {size_bytes} bytes"
+            )
+
+            if kind == "text":
+                try:
+                    text = data.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"text file '{filename}' must be valid UTF-8",
+                    ) from exc
+                content_items.append({
+                    "type": "input_text",
+                    "text": f"{file_label}\n\nText content:\n{text}",
+                })
+            elif kind == "image":
+                encoded = base64.b64encode(data).decode("ascii")
+                content_items.append({"type": "input_text", "text": file_label})
+                content_items.append({"type": "input_image", "image_url": f"data:{content_type};base64,{encoded}"})
+            elif kind == "pdf":
+                encoded = base64.b64encode(data).decode("ascii")
+                content_items.append({"type": "input_text", "text": file_label})
+                content_items.append({
+                    "type": "input_file",
+                    "filename": filename,
+                    "file_data": f"data:application/pdf;base64,{encoded}",
+                })
+
+        return content_items, file_metadata
+
+    def _summary_form_string(form: FormData, field: str, *, required: bool) -> str | None:
+        value = form.get(field)
+        if value is None:
+            if required:
+                raise HTTPException(status_code=400, detail=f"{field} is required")
+            return None
+        if not isinstance(value, str):
+            raise HTTPException(status_code=400, detail=f"{field} must be a string")
+        stripped = value.strip()
+        if required and stripped == "":
+            raise HTTPException(status_code=400, detail=f"{field} is required")
+        return stripped if required else value
+
+    def _summary_form_files(form: FormData) -> list[UploadFile | StarletteUploadFile]:
+        values = form.getlist("files")
+        files = [value for value in values if isinstance(value, (UploadFile, StarletteUploadFile))]
+        if len(files) != len(values):
+            raise HTTPException(status_code=400, detail="files must be uploaded as multipart file fields")
+        return files
 
     # ------------------------------------------------------------------
     # Endpoints
@@ -334,7 +520,10 @@ try:
         }
 
     @app.post("/v1/chat/completions", response_model=None)
-    async def chat_completions(request: ChatCompletionRequest, http_request: Request) -> JSONResponse | StreamingResponse:
+    async def chat_completions(
+        request: ChatCompletionRequest,
+        http_request: Request,
+    ) -> JSONResponse | StreamingResponse:
         _require_api_key(http_request)
         _require_auth()
         provider = _get_provider()
@@ -552,10 +741,13 @@ try:
         }
 
         if response.usage:
+            total_tokens = response.usage.total_tokens or (
+                response.usage.prompt_tokens + response.usage.completion_tokens
+            )
             result["usage"] = {
                 "prompt_tokens": response.usage.prompt_tokens,
                 "completion_tokens": response.usage.completion_tokens,
-                "total_tokens": response.usage.total_tokens or (response.usage.prompt_tokens + response.usage.completion_tokens),
+                "total_tokens": total_tokens,
             }
 
         return JSONResponse(content=result)
@@ -581,15 +773,42 @@ try:
         ]
         return JSONResponse(content={"created": int(time.time()), "data": data})
 
+    @app.post("/v1/files/summarize")
+    async def files_summarize(http_request: Request) -> JSONResponse:
+        _require_api_key(http_request)
+        _require_auth()
+        form = await http_request.form()
+        try:
+            request_model = _summary_form_string(form, "model", required=True)
+            context = _summary_form_string(form, "context", required=False)
+            reasoning_effort = _summary_form_string(form, "reasoning_effort", required=False)
+            files = _summary_form_files(form)
+            content_items, file_metadata = await _summary_content_from_uploads(files, context)
+        finally:
+            await form.close()
+        provider = _get_provider()
+        summary = provider.summarize_files(
+            content_items,
+            model=request_model or MODEL,
+            reasoning_effort=reasoning_effort,
+        )
+        return JSONResponse(
+            content={
+                "summary": summary,
+                "model": _openai_model_id(request_model or MODEL),
+                "files": file_metadata,
+            }
+        )
+
     # ------------------------------------------------------------------
     # Anthropic Messages API compatible endpoint
     # ------------------------------------------------------------------
 
     from .anthropic_adapter import (
         anthropic_request_to_internal,
-        internal_response_to_anthropic,
         anthropic_stream_adapter,
         format_anthropic_error,
+        internal_response_to_anthropic,
     )
 
     @app.post("/v1/messages", response_model=None)
@@ -703,10 +922,11 @@ try:
 
 except ImportError as _import_exc:
     # FastAPI / uvicorn not installed
+    _fastapi_import_error = _import_exc
     app = None  # type: ignore[assignment]
 
     def main() -> None:  # type: ignore[misc]
         raise ImportError(
             "FastAPI and uvicorn are required to run the server. "
             "Install with: pip install 'codex-as-api[server]'"
-        ) from _import_exc
+        ) from _fastapi_import_error

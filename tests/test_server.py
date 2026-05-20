@@ -1,17 +1,29 @@
 from __future__ import annotations
 
-import json
 import logging
 
 import pytest
 
-from codex_as_api.auth import ChatGPTOAuthError, ChatGPTOAuthMissingError
+
+class RecordingSummaryProvider:
+    def __init__(self, summary: str = "integrated summary") -> None:
+        self.summary = summary
+        self.calls: list[dict] = []
+
+    def summarize_files(self, content_items, *, model=None, reasoning_effort=None):
+        self.calls.append({
+            "content_items": content_items,
+            "model": model,
+            "reasoning_effort": reasoning_effort,
+        })
+        return self.summary
 
 
 @pytest.fixture()
 def client():
-    from codex_as_api.server import app
     from fastapi.testclient import TestClient
+
+    from codex_as_api.server import app
     return TestClient(app, raise_server_exceptions=False)
 
 
@@ -68,8 +80,9 @@ def test_chat_completions_missing_api_key_returns_401(tmp_path):
     server_mod.AUTH_PATH = str(tmp_path / "nonexistent.json")
     server_mod._provider = None
     try:
-        from codex_as_api.server import app
         from fastapi.testclient import TestClient
+
+        from codex_as_api.server import app
         c = TestClient(app, raise_server_exceptions=False)
         payload = {
             "model": "gpt-5.5",
@@ -96,8 +109,9 @@ def test_chat_completions_valid_api_key_continues_to_oauth_check(tmp_path):
     server_mod.AUTH_PATH = str(tmp_path / "nonexistent.json")
     server_mod._provider = None
     try:
-        from codex_as_api.server import app
         from fastapi.testclient import TestClient
+
+        from codex_as_api.server import app
         c = TestClient(app, raise_server_exceptions=False)
         payload = {
             "model": "gpt-5.5",
@@ -113,6 +127,192 @@ def test_chat_completions_valid_api_key_continues_to_oauth_check(tmp_path):
         server_mod.API_KEY = old_api_key
         server_mod.AUTH_PATH = old_auth_path
         server_mod._provider = None
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/files/summarize
+# ---------------------------------------------------------------------------
+
+
+def test_files_summarize_multipart_parses_files_and_context(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    import codex_as_api.server as server_mod
+    from codex_as_api.server import app
+
+    provider = RecordingSummaryProvider("summary text")
+    monkeypatch.setattr(server_mod, "API_KEY", None)
+    monkeypatch.setattr(server_mod, "_require_auth", lambda: None)
+    monkeypatch.setattr(server_mod, "_provider", provider)
+
+    c = TestClient(app, raise_server_exceptions=False)
+    resp = c.post(
+        "/v1/files/summarize",
+        data={
+            "model": "gpt-5.5",
+            "context": "May 2026 ABC vendor ledger",
+            "reasoning_effort": "high",
+        },
+        files=[
+            ("files", ("ledger.pdf", b"%PDF-1.4\nfake", "application/pdf")),
+            ("files", ("receipt.png", b"\x89PNG\r\n\x1a\nfake", "image/png")),
+            ("files", ("memo.txt", b"Payment memo", "text/plain")),
+        ],
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["summary"] == "summary text"
+    assert body["model"] == "codex-oauth:gpt-5.5"
+    assert body["files"] == [
+        {"filename": "ledger.pdf", "content_type": "application/pdf", "size_bytes": 13, "kind": "pdf"},
+        {"filename": "receipt.png", "content_type": "image/png", "size_bytes": 12, "kind": "image"},
+        {"filename": "memo.txt", "content_type": "text/plain", "size_bytes": 12, "kind": "text"},
+    ]
+
+    assert len(provider.calls) == 1
+    call = provider.calls[0]
+    assert call["model"] == "gpt-5.5"
+    assert call["reasoning_effort"] == "high"
+    content_items = call["content_items"]
+    text_payload = "\n".join(item["text"] for item in content_items if item["type"] == "input_text")
+    assert "Context metadata:\nMay 2026 ABC vendor ledger" in text_payload
+    assert "not a summary instruction" in text_payload
+    assert "Payment memo" in text_payload
+
+    pdf_items = [item for item in content_items if item["type"] == "input_file"]
+    assert pdf_items == [{
+        "type": "input_file",
+        "filename": "ledger.pdf",
+        "file_data": pdf_items[0]["file_data"],
+    }]
+    assert pdf_items[0]["file_data"].startswith("data:application/pdf;base64,")
+
+    image_items = [item for item in content_items if item["type"] == "input_image"]
+    assert len(image_items) == 1
+    assert image_items[0]["image_url"].startswith("data:image/png;base64,")
+
+
+def test_files_summarize_missing_files_returns_4xx(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    import codex_as_api.server as server_mod
+    from codex_as_api.server import app
+
+    monkeypatch.setattr(server_mod, "API_KEY", None)
+    c = TestClient(app, raise_server_exceptions=False)
+    resp = c.post("/v1/files/summarize", data={"model": "gpt-5.5"})
+    assert 400 <= resp.status_code < 500
+
+
+def test_files_summarize_too_many_files_returns_400(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    import codex_as_api.server as server_mod
+    from codex_as_api.server import app
+
+    provider = RecordingSummaryProvider()
+    monkeypatch.setattr(server_mod, "API_KEY", None)
+    monkeypatch.setattr(server_mod, "_require_auth", lambda: None)
+    monkeypatch.setattr(server_mod, "_provider", provider)
+    monkeypatch.setattr(server_mod, "MAX_SUMMARY_FILES", 2)
+
+    c = TestClient(app, raise_server_exceptions=False)
+    resp = c.post(
+        "/v1/files/summarize",
+        data={"model": "gpt-5.5"},
+        files=[
+            ("files", ("one.txt", b"one", "text/plain")),
+            ("files", ("two.txt", b"two", "text/plain")),
+            ("files", ("three.txt", b"three", "text/plain")),
+        ],
+    )
+    assert resp.status_code == 400
+    assert provider.calls == []
+
+
+def test_files_summarize_file_too_large_returns_413(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    import codex_as_api.server as server_mod
+    from codex_as_api.server import app
+
+    provider = RecordingSummaryProvider()
+    monkeypatch.setattr(server_mod, "API_KEY", None)
+    monkeypatch.setattr(server_mod, "_require_auth", lambda: None)
+    monkeypatch.setattr(server_mod, "_provider", provider)
+    monkeypatch.setattr(server_mod, "MAX_SUMMARY_FILE_BYTES", 5)
+
+    c = TestClient(app, raise_server_exceptions=False)
+    resp = c.post(
+        "/v1/files/summarize",
+        data={"model": "gpt-5.5"},
+        files=[("files", ("large.txt", b"123456", "text/plain"))],
+    )
+    assert resp.status_code == 413
+    assert provider.calls == []
+
+
+def test_files_summarize_unsupported_file_type_returns_415(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    import codex_as_api.server as server_mod
+    from codex_as_api.server import app
+
+    provider = RecordingSummaryProvider()
+    monkeypatch.setattr(server_mod, "API_KEY", None)
+    monkeypatch.setattr(server_mod, "_require_auth", lambda: None)
+    monkeypatch.setattr(server_mod, "_provider", provider)
+
+    c = TestClient(app, raise_server_exceptions=False)
+    resp = c.post(
+        "/v1/files/summarize",
+        data={"model": "gpt-5.5"},
+        files=[("files", ("payload.bin", b"\x00\x01", "application/octet-stream"))],
+    )
+    assert resp.status_code == 415
+    assert provider.calls == []
+
+
+def test_files_summarize_missing_api_key_returns_401(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    import codex_as_api.server as server_mod
+    from codex_as_api.server import app
+
+    monkeypatch.setattr(server_mod, "API_KEY", "secret-key")
+    monkeypatch.setattr(server_mod, "_require_auth", lambda: pytest.fail("_require_auth should not run"))
+
+    c = TestClient(app, raise_server_exceptions=False)
+    resp = c.post(
+        "/v1/files/summarize",
+        data={"model": "gpt-5.5"},
+        files=[("files", ("memo.txt", b"hello", "text/plain"))],
+    )
+    assert resp.status_code == 401
+    assert resp.headers["www-authenticate"] == "Bearer"
+    assert resp.json()["error"]["type"] == "api_auth_error"
+
+
+def test_files_summarize_valid_api_key_continues_to_oauth_check(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    import codex_as_api.server as server_mod
+    from codex_as_api.server import app
+
+    monkeypatch.setattr(server_mod, "API_KEY", "secret-key")
+    monkeypatch.setattr(server_mod, "AUTH_PATH", str(tmp_path / "nonexistent.json"))
+    monkeypatch.setattr(server_mod, "_provider", None)
+
+    c = TestClient(app, raise_server_exceptions=False)
+    resp = c.post(
+        "/v1/files/summarize",
+        headers={"Authorization": "Bearer secret-key"},
+        data={"model": "gpt-5.5"},
+        files=[("files", ("memo.txt", b"hello", "text/plain"))],
+    )
+    assert resp.status_code == 401
+    assert resp.json()["error"]["type"] == "chatgpt_oauth_error"
 
 
 # ---------------------------------------------------------------------------
@@ -214,8 +414,9 @@ def test_chat_completions_missing_auth_returns_auth_error(tmp_path, monkeypatch)
     server_mod.AUTH_PATH = str(tmp_path / "nonexistent.json")
     server_mod._provider = None
     try:
-        from codex_as_api.server import app
         from fastapi.testclient import TestClient
+
+        from codex_as_api.server import app
         c = TestClient(app, raise_server_exceptions=False)
         payload = {
             "model": "gpt-5.5",
@@ -241,8 +442,9 @@ def test_chat_completions_stream_missing_auth_returns_401_before_streaming(tmp_p
     server_mod.AUTH_PATH = str(tmp_path / "nonexistent.json")
     server_mod._provider = None
     try:
-        from codex_as_api.server import app
         from fastapi.testclient import TestClient
+
+        from codex_as_api.server import app
         c = TestClient(app, raise_server_exceptions=False)
         payload = {
             "model": "gpt-5.5",

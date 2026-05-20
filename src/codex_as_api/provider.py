@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 import threading
-import uuid
 import urllib.error
 import urllib.request
-from typing import Any, Iterator, Sequence
+import uuid
+from collections.abc import Iterator, Sequence
+from contextlib import suppress
+from typing import Any
 
-from .messages import AssistantResponse, Message, MessageRole, ToolCall, ToolSchema, Usage
 from .auth import (
     ChatGPTOAuthError,
     load_token_data,
@@ -15,6 +16,7 @@ from .auth import (
     refresh_token,
     register_token_secrets,
 )
+from .messages import AssistantResponse, Message, MessageRole, ToolCall, ToolSchema, Usage
 from .protocol import (
     reasoning_from_response_items,
     response_failure_message,
@@ -24,6 +26,12 @@ CHATGPT_OAUTH_DEFAULT_BASE_URL = "https://chatgpt.com/backend-api/codex"
 CHATGPT_OAUTH_DEFAULT_MODEL = "gpt-5.5"
 REMOTE_COMPACTION_MARKER = "[Remote Responses compacted history]"
 REASONING_EFFORT_VALUES = frozenset({"none", "minimal", "low", "medium", "high", "xhigh"})
+FILE_SUMMARY_INSTRUCTIONS = (
+    "Summarize the uploaded files as one integrated document bundle. "
+    "User-provided context is background metadata for interpreting the entire file bundle, not a summary instruction. "
+    "Reflect that metadata where relevant, rely on the attached file contents, "
+    "and return only the consolidated summary."
+)
 
 
 class ChatGPTOAuthProvider:
@@ -54,10 +62,8 @@ class ChatGPTOAuthProvider:
         with self._active_response_lock:
             responses = list(self._active_responses)
         for response in responses:
-            try:
+            with suppress(Exception):
                 response.close()
-            except Exception:
-                pass
 
     def chat(
         self,
@@ -107,7 +113,13 @@ class ChatGPTOAuthProvider:
             elif event.get("type") in {"reasoning_delta", "reasoning_raw_delta"}:
                 reasoning_parts.append(str(event.get("text", "")))
             elif event.get("type") == "tool_call":
-                tool_calls.append(ToolCall(id=str(event["id"]), name=str(event["name"]), arguments=dict(event.get("arguments") or {})))
+                tool_calls.append(
+                    ToolCall(
+                        id=str(event["id"]),
+                        name=str(event["name"]),
+                        arguments=dict(event.get("arguments") or {}),
+                    )
+                )
             elif event.get("type") == "finish":
                 finish_reason = str(event.get("finish_reason") or finish_reason)
                 if isinstance(event.get("reasoning_content"), str):
@@ -302,6 +314,32 @@ class ChatGPTOAuthProvider:
             raise ChatGPTOAuthError("image inspection response returned empty content")
         return text
 
+    def summarize_files(
+        self,
+        content_items: Sequence[dict[str, Any]],
+        *,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
+    ) -> str:
+        content = _validate_file_summary_content_items(content_items)
+        payload = {
+            "model": model or self.model,
+            "instructions": FILE_SUMMARY_INSTRUCTIONS,
+            "input": [{"type": "message", "role": "user", "content": content}],
+            "tools": [],
+            "parallel_tool_calls": False,
+            "stream": True,
+            "store": False,
+            "include": [],
+            "prompt_cache_key": str(uuid.uuid4()),
+        }
+        _set_reasoning_payload(payload, reasoning_effort)
+        output_items = self._collect_response_output_items(payload)
+        text = _text_from_response_items(output_items).strip()
+        if text == "":
+            raise ChatGPTOAuthError("file summarization response returned empty content")
+        return text
+
     def _collect_response_output_items(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
         output_items: list[dict[str, Any]] = []
         completed_output_seen = False
@@ -430,10 +468,20 @@ class ChatGPTOAuthProvider:
             raise ChatGPTOAuthError("ChatGPT OAuth response must be a JSON object")
         return data
 
-    def _post_sse(self, path: str, payload: dict[str, Any], extra_headers: dict[str, str] | None = None) -> Iterator[dict[str, Any]]:
+    def _post_sse(
+        self,
+        path: str,
+        payload: dict[str, Any],
+        extra_headers: dict[str, str] | None = None,
+    ) -> Iterator[dict[str, Any]]:
         yield from self._request_sse(path, payload, extra_headers=extra_headers)
 
-    def _request_sse(self, path: str, payload: dict[str, Any], extra_headers: dict[str, str] | None = None) -> Iterator[dict[str, Any]]:
+    def _request_sse(
+        self,
+        path: str,
+        payload: dict[str, Any],
+        extra_headers: dict[str, str] | None = None,
+    ) -> Iterator[dict[str, Any]]:
         token_values: tuple[str | None, ...] = (None,)
         for attempt in range(2):
             headers = self._headers()
@@ -481,7 +529,8 @@ class ChatGPTOAuthProvider:
                     continue
                 raise ChatGPTOAuthError(f"ChatGPT OAuth request failed: HTTP {exc.code}: {redacted}") from exc
             except Exception as exc:  # noqa: BLE001
-                raise ChatGPTOAuthError(f"ChatGPT OAuth request failed: {redact_text(str(exc), *token_values)}") from exc
+                redacted = redact_text(str(exc), *token_values)
+                raise ChatGPTOAuthError(f"ChatGPT OAuth request failed: {redacted}") from exc
             return
 
     def _request_json(self, path: str, payload: dict[str, Any]) -> bytes:
@@ -507,7 +556,8 @@ class ChatGPTOAuthProvider:
                     continue
                 raise ChatGPTOAuthError(f"ChatGPT OAuth request failed: HTTP {exc.code}: {redacted}") from exc
             except Exception as exc:  # noqa: BLE001
-                raise ChatGPTOAuthError(f"ChatGPT OAuth request failed: {redact_text(str(exc), *token_values)}") from exc
+                redacted = redact_text(str(exc), *token_values)
+                raise ChatGPTOAuthError(f"ChatGPT OAuth request failed: {redacted}") from exc
         raise AssertionError("unreachable ChatGPT OAuth request retry state")
 
 
@@ -522,6 +572,39 @@ def _validate_image_content_items(images: Sequence[dict[str, str]]) -> list[dict
         if not image_url.startswith("data:image/"):
             raise ChatGPTOAuthError(f"image reference {index} must be a data:image URL")
         items.append({"type": "input_image", "image_url": image_url})
+    return items
+
+
+def _validate_file_summary_content_items(content_items: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for index, item in enumerate(content_items):
+        if not isinstance(item, dict):
+            raise ChatGPTOAuthError(f"file summary content item {index} must be an object")
+        item_type = item.get("type")
+        if item_type == "input_text":
+            text = item.get("text")
+            if not isinstance(text, str):
+                raise ChatGPTOAuthError(f"file summary content item {index} input_text requires text")
+            items.append({"type": "input_text", "text": text})
+            continue
+        if item_type == "input_image":
+            image_url = item.get("image_url")
+            if not isinstance(image_url, str) or not image_url.startswith("data:image/"):
+                raise ChatGPTOAuthError(f"file summary content item {index} input_image requires data:image URL")
+            items.append({"type": "input_image", "image_url": image_url})
+            continue
+        if item_type == "input_file":
+            filename = item.get("filename")
+            file_data = item.get("file_data")
+            if not isinstance(filename, str) or filename.strip() == "":
+                raise ChatGPTOAuthError(f"file summary content item {index} input_file requires filename")
+            if not isinstance(file_data, str) or not file_data.startswith("data:application/pdf;base64,"):
+                raise ChatGPTOAuthError(f"file summary content item {index} input_file requires PDF file_data")
+            items.append({"type": "input_file", "filename": filename, "file_data": file_data})
+            continue
+        raise ChatGPTOAuthError(f"unsupported file summary content item type: {item_type}")
+    if not items:
+        raise ChatGPTOAuthError("file summary content items are required")
     return items
 
 
@@ -611,7 +694,13 @@ def _message_item(role: str, content: str, images: tuple[str, ...] = ()) -> dict
 
 
 def _tool_schema_to_response_dict(tool: ToolSchema) -> dict[str, Any]:
-    return {"type": "function", "name": tool.name, "description": tool.description, "parameters": tool.parameters, "strict": False}
+    return {
+        "type": "function",
+        "name": tool.name,
+        "description": tool.description,
+        "parameters": tool.parameters,
+        "strict": False,
+    }
 
 
 def _set_reasoning_payload(payload: dict[str, Any], reasoning_effort: str | None) -> None:
