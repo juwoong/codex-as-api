@@ -232,6 +232,8 @@ Environment variables (Python, Rust, and TypeScript):
 | `CODEX_AS_API_API_KEY` | unset | Optional fixed bearer token required for `/v1` API calls |
 | `JOB_WEBHOOK_CREDENTIAL` | unset | Optional bearer token sent on Python/FastAPI webhook job callbacks |
 | `JOB_WEBHOOK_TIMEOUT_SECONDS` | `30` | Timeout for Python/FastAPI webhook job callback POST requests |
+| `CODEX_AS_API_VALIDATION_LOG_BODY_MAX_CHARS` | `20000` | Maximum logged request body size for Python/FastAPI 422 validation errors |
+| `CODEX_AS_API_VALIDATION_LOG_VALUE_MAX_CHARS` | `4000` | Maximum logged string value size for Python/FastAPI 422 validation errors |
 
 ### Supported Models
 
@@ -369,6 +371,8 @@ Webhook success callback:
 ```
 
 If generation fails after the job is queued, the same webhook receives `status: "failed"` with an `error` object.
+
+For 422 validation failures, the Python/FastAPI server logs the validation `request_body` and `response_body.detail` before returning. Authorization, token, credential, password, secret fields, and webhook URL query strings are redacted; large fields are truncated using `CODEX_AS_API_VALIDATION_LOG_*` limits.
 
 ### `POST /v1/messages`
 

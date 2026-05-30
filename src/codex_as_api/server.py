@@ -42,6 +42,8 @@ AUTH_PATH = os.getenv("CODEX_AS_API_AUTH_PATH")
 API_KEY = os.getenv("CODEX_AS_API_API_KEY")
 JOB_WEBHOOK_CREDENTIAL = os.getenv("JOB_WEBHOOK_CREDENTIAL")
 JOB_WEBHOOK_TIMEOUT_SECONDS = _env_int("JOB_WEBHOOK_TIMEOUT_SECONDS", 30)
+VALIDATION_LOG_BODY_MAX_CHARS = _env_int("CODEX_AS_API_VALIDATION_LOG_BODY_MAX_CHARS", 20000)
+VALIDATION_LOG_VALUE_MAX_CHARS = _env_int("CODEX_AS_API_VALIDATION_LOG_VALUE_MAX_CHARS", 4000)
 MAX_SUMMARY_FILES = 10
 MAX_SUMMARY_FILE_BYTES = 10 * 1024 * 1024
 SUMMARY_TEXT_MIME_TYPES = frozenset({
@@ -149,6 +151,8 @@ def _require_auth() -> None:
 # FastAPI is an optional dependency; fail gracefully if missing.
 try:
     from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, UploadFile
+    from fastapi.encoders import jsonable_encoder
+    from fastapi.exceptions import RequestValidationError
     from fastapi.responses import JSONResponse, StreamingResponse
     from pydantic import BaseModel
     from starlette.datastructures import FormData
@@ -221,6 +225,22 @@ try:
             headers={"WWW-Authenticate": "Bearer"},
             content={"error": {"message": str(exc), "type": "api_auth_error"}},
         )
+
+    @app.exception_handler(RequestValidationError)
+    async def _request_validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+        response_body = {"detail": jsonable_encoder(exc.errors())}
+        raw_body = getattr(exc, "body", None)
+        if raw_body is None:
+            raw_body = await request.body()
+        log_payload = {
+            "method": request.method,
+            "path": request.url.path,
+            "status_code": 422,
+            "request_body": _request_body_for_error_log(raw_body),
+            "response_body": _redact_log_value(response_body),
+        }
+        _request_logger.error("request validation error %s", _json_log(log_payload))
+        return JSONResponse(status_code=422, content=response_body)
 
     # ------------------------------------------------------------------
     # Request/response schemas
@@ -376,6 +396,55 @@ try:
 
     def _json_log(fields: dict[str, Any]) -> str:
         return json.dumps(fields, ensure_ascii=False, sort_keys=True, default=str)
+
+    SENSITIVE_LOG_KEY_PARTS = frozenset({
+        "authorization",
+        "api_key",
+        "apikey",
+        "access_token",
+        "refresh_token",
+        "id_token",
+        "credential",
+        "password",
+        "secret",
+        "token",
+    })
+
+    def _truncate_log_text(value: str, max_chars: int = VALIDATION_LOG_VALUE_MAX_CHARS) -> str:
+        if len(value) <= max_chars:
+            return value
+        return f"{value[:max_chars]}...<truncated {len(value) - max_chars} chars>"
+
+    def _redact_log_value(value: Any, key: str | None = None) -> Any:
+        lowered_key = key.lower() if key else ""
+        if lowered_key and any(part in lowered_key for part in SENSITIVE_LOG_KEY_PARTS):
+            return "<redacted>"
+        if lowered_key == "webhook_url" and isinstance(value, str):
+            return _safe_webhook_url(value)
+        if isinstance(value, dict):
+            return {
+                str(item_key): _redact_log_value(item_value, str(item_key))
+                for item_key, item_value in value.items()
+            }
+        if isinstance(value, list):
+            return [_redact_log_value(item) for item in value]
+        if isinstance(value, str):
+            return _truncate_log_text(value)
+        return value
+
+    def _request_body_for_error_log(raw_body: Any) -> Any:
+        if isinstance(raw_body, (dict, list)):
+            return _redact_log_value(raw_body)
+        text = raw_body.decode("utf-8", "replace") if isinstance(raw_body, bytes) else str(raw_body)
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            return _truncate_log_text(text, VALIDATION_LOG_BODY_MAX_CHARS)
+        redacted = _redact_log_value(parsed)
+        encoded = json.dumps(redacted, ensure_ascii=False, sort_keys=True, default=str)
+        if len(encoded) <= VALIDATION_LOG_BODY_MAX_CHARS:
+            return redacted
+        return _truncate_log_text(encoded, VALIDATION_LOG_BODY_MAX_CHARS)
 
     def _safe_webhook_url(webhook_url: str) -> str:
         parsed = urllib.parse.urlparse(webhook_url)
