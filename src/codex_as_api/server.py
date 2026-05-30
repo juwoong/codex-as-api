@@ -7,8 +7,10 @@ import logging
 import mimetypes
 import os
 import time
+import urllib.parse
+import urllib.request
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from typing import Any
 
 from .auth import (
@@ -38,6 +40,8 @@ PORT = _env_int("CODEX_AS_API_PORT", 18080)
 MODEL = _env_str("CODEX_AS_API_MODEL", "gpt-5.5")
 AUTH_PATH = os.getenv("CODEX_AS_API_AUTH_PATH")
 API_KEY = os.getenv("CODEX_AS_API_API_KEY")
+JOB_WEBHOOK_CREDENTIAL = os.getenv("JOB_WEBHOOK_CREDENTIAL")
+JOB_WEBHOOK_TIMEOUT_SECONDS = _env_int("JOB_WEBHOOK_TIMEOUT_SECONDS", 30)
 MAX_SUMMARY_FILES = 10
 MAX_SUMMARY_FILE_BYTES = 10 * 1024 * 1024
 SUMMARY_TEXT_MIME_TYPES = frozenset({
@@ -144,10 +148,11 @@ def _require_auth() -> None:
 
 # FastAPI is an optional dependency; fail gracefully if missing.
 try:
-    from fastapi import FastAPI, HTTPException, Request, UploadFile
+    from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, UploadFile
     from fastapi.responses import JSONResponse, StreamingResponse
     from pydantic import BaseModel
-    from starlette.datastructures import FormData, UploadFile as StarletteUploadFile
+    from starlette.datastructures import FormData
+    from starlette.datastructures import UploadFile as StarletteUploadFile
 
     app = FastAPI(
         title="codex-as-api",
@@ -250,6 +255,9 @@ try:
         service_tier: str | None = None
         text: dict[str, Any] | None = None
         client_metadata: dict[str, str] | None = None
+
+    class WebhookChatCompletionRequest(ChatCompletionRequest):
+        webhook_url: str
 
     class ImageGenerationRequest(BaseModel):
         model: str
@@ -362,6 +370,273 @@ try:
         if req.max_completion_tokens is not None:
             return req.max_completion_tokens
         return req.max_tokens
+
+    def _normalized_headers(headers: Mapping[str, str]) -> dict[str, str]:
+        return {str(key).lower(): str(value) for key, value in headers.items()}
+
+    def _json_log(fields: dict[str, Any]) -> str:
+        return json.dumps(fields, ensure_ascii=False, sort_keys=True, default=str)
+
+    def _safe_webhook_url(webhook_url: str) -> str:
+        parsed = urllib.parse.urlparse(webhook_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return "<invalid>"
+        return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
+
+    def _message_role_counts(messages: list[ChatMessage]) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for message in messages:
+            role = (message.role or "unknown").lower()
+            counts[role] = counts.get(role, 0) + 1
+        return counts
+
+    def _request_header_options(
+        request: ChatCompletionRequest,
+        headers: Mapping[str, str],
+    ) -> tuple[str | None, bool | None]:
+        normalized_headers = _normalized_headers(headers)
+        subagent = request.subagent or normalized_headers.get("x-openai-subagent")
+        memgen_request_header = normalized_headers.get("x-openai-memgen-request")
+        memgen_request: bool | None = request.memgen_request
+        if memgen_request is None and memgen_request_header is not None:
+            memgen_request = memgen_request_header.lower() not in ("false", "0", "")
+        return subagent, memgen_request
+
+    def _chat_request_log_fields(
+        *,
+        job_id: str,
+        request: WebhookChatCompletionRequest,
+        headers: Mapping[str, str],
+    ) -> dict[str, Any]:
+        subagent, memgen_request = _request_header_options(request, headers)
+        return {
+            "job_id": job_id,
+            "model": request.model,
+            "message_count": len(request.messages),
+            "message_roles": _message_role_counts(request.messages),
+            "stream": request.stream,
+            "tool_count": len(request.tools or []),
+            "tool_choice_present": request.tool_choice is not None,
+            "reasoning_effort": request.reasoning_effort,
+            "max_tokens": _max_tokens_from_request(request),
+            "stop_count": len(_normalize_stop(request.stop) or []),
+            "prompt_cache_key_present": request.prompt_cache_key is not None,
+            "previous_response_id_present": request.previous_response_id is not None,
+            "service_tier": request.service_tier,
+            "text_present": request.text is not None,
+            "client_metadata_count": len(request.client_metadata or {}),
+            "subagent": subagent,
+            "memgen_request": memgen_request,
+            "webhook_url": _safe_webhook_url(request.webhook_url),
+            "webhook_credential_configured": bool(JOB_WEBHOOK_CREDENTIAL),
+            "webhook_timeout_seconds": JOB_WEBHOOK_TIMEOUT_SECONDS,
+        }
+
+    def _chat_response_log_fields(job_id: str, payload: dict[str, Any], duration_ms: float) -> dict[str, Any]:
+        response = payload.get("response") if isinstance(payload.get("response"), dict) else {}
+        choices = response.get("choices") if isinstance(response, dict) else None
+        first_choice = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
+        message = first_choice.get("message") if isinstance(first_choice.get("message"), dict) else {}
+        content = message.get("content") if isinstance(message, dict) else ""
+        tool_calls = message.get("tool_calls") if isinstance(message, dict) else None
+        return {
+            "job_id": job_id,
+            "status": payload.get("status"),
+            "duration_ms": round(duration_ms, 2),
+            "completion_id": response.get("id") if isinstance(response, dict) else None,
+            "model": response.get("model") if isinstance(response, dict) else None,
+            "choice_count": len(choices) if isinstance(choices, list) else 0,
+            "finish_reason": first_choice.get("finish_reason"),
+            "usage": response.get("usage") if isinstance(response, dict) else None,
+            "content_chars": len(content) if isinstance(content, str) else 0,
+            "reasoning_present": bool(message.get("reasoning_content")) if isinstance(message, dict) else False,
+            "tool_call_count": len(tool_calls) if isinstance(tool_calls, list) else 0,
+        }
+
+    def _chat_completion_response_payload(
+        request: ChatCompletionRequest,
+        headers: Mapping[str, str],
+    ) -> dict[str, Any]:
+        provider = _get_provider()
+        messages = _request_messages_to_internal(request.messages)
+        tools = _parse_tools(request.tools)
+        stop = _normalize_stop(request.stop)
+        max_tokens = _max_tokens_from_request(request)
+        subagent, memgen_request = _request_header_options(request, headers)
+
+        response = provider.chat(
+            messages,
+            model=request.model,
+            tools=tools,
+            tool_choice=request.tool_choice,
+            temperature=request.temperature,
+            reasoning_effort=request.reasoning_effort,
+            max_tokens=max_tokens,
+            stop=stop,
+            prompt_cache_key=request.prompt_cache_key,
+            subagent=subagent,
+            memgen_request=memgen_request,
+            previous_response_id=request.previous_response_id,
+            service_tier=request.service_tier,
+            text=request.text,
+            client_metadata=request.client_metadata,
+        )
+
+        choices: list[dict[str, Any]] = [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": response.content,
+            },
+            "finish_reason": response.finish_reason,
+        }]
+
+        if response.tool_calls:
+            choices[0]["message"]["tool_calls"] = [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.name,
+                        "arguments": json.dumps(tc.arguments, ensure_ascii=False),
+                    },
+                }
+                for tc in response.tool_calls
+            ]
+
+        if response.reasoning_content:
+            choices[0]["message"]["reasoning_content"] = response.reasoning_content
+
+        result: dict[str, Any] = {
+            "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": _openai_model_id(request.model),
+            "choices": choices,
+        }
+
+        if response.usage:
+            total_tokens = response.usage.total_tokens or (
+                response.usage.prompt_tokens + response.usage.completion_tokens
+            )
+            result["usage"] = {
+                "prompt_tokens": response.usage.prompt_tokens,
+                "completion_tokens": response.usage.completion_tokens,
+                "total_tokens": total_tokens,
+            }
+
+        return result
+
+    def _validate_webhook_url(webhook_url: str) -> None:
+        parsed = urllib.parse.urlparse(webhook_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise HTTPException(status_code=400, detail="webhook_url must be an absolute http(s) URL")
+
+    def _webhook_delivery_headers() -> dict[str, str]:
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "codex-as-api",
+        }
+        credential = JOB_WEBHOOK_CREDENTIAL.strip() if JOB_WEBHOOK_CREDENTIAL else ""
+        if credential:
+            headers["Authorization"] = f"Bearer {credential}"
+        return headers
+
+    def _webhook_error_type(exc: Exception) -> str:
+        if isinstance(exc, ChatGPTOAuthError):
+            return "chatgpt_oauth_error"
+        if isinstance(exc, APIAuthError):
+            return "api_auth_error"
+        return "server_error"
+
+    def _post_job_webhook(webhook_url: str, payload: dict[str, Any]) -> int:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        request = urllib.request.Request(
+            webhook_url,
+            data=data,
+            headers=_webhook_delivery_headers(),
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=JOB_WEBHOOK_TIMEOUT_SECONDS) as response:
+            response.read()
+            return int(response.getcode())
+
+    def _run_chat_completion_webhook_job(
+        job_id: str,
+        request: ChatCompletionRequest,
+        headers: Mapping[str, str],
+        webhook_url: str,
+    ) -> None:
+        started_at = time.perf_counter()
+        try:
+            response_payload = _chat_completion_response_payload(request, headers)
+            payload = {
+                "id": job_id,
+                "object": "chat.completion.webhook",
+                "status": "completed",
+                "created": int(time.time()),
+                "response": response_payload,
+            }
+            _request_logger.info(
+                "webhook job response %s",
+                _json_log(_chat_response_log_fields(job_id, payload, (time.perf_counter() - started_at) * 1000)),
+            )
+        except Exception as exc:
+            payload = {
+                "id": job_id,
+                "object": "chat.completion.webhook",
+                "status": "failed",
+                "created": int(time.time()),
+                "error": {
+                    "message": str(exc),
+                    "type": _webhook_error_type(exc),
+                },
+            }
+            _request_logger.exception(
+                "webhook job response %s",
+                _json_log({
+                    "job_id": job_id,
+                    "status": "failed",
+                    "duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
+                    "error_type": _webhook_error_type(exc),
+                    "error_message": str(exc),
+                }),
+            )
+
+        delivery_started_at = time.perf_counter()
+        payload_bytes = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+        _request_logger.info(
+            "webhook delivery request %s",
+            _json_log({
+                "job_id": job_id,
+                "webhook_url": _safe_webhook_url(webhook_url),
+                "payload_status": payload.get("status"),
+                "payload_bytes": payload_bytes,
+                "credential_configured": bool(JOB_WEBHOOK_CREDENTIAL),
+                "timeout_seconds": JOB_WEBHOOK_TIMEOUT_SECONDS,
+            }),
+        )
+        try:
+            status_code = _post_job_webhook(webhook_url, payload)
+            _request_logger.info(
+                "webhook delivery response %s",
+                _json_log({
+                    "job_id": job_id,
+                    "webhook_url": _safe_webhook_url(webhook_url),
+                    "status_code": status_code,
+                    "duration_ms": round((time.perf_counter() - delivery_started_at) * 1000, 2),
+                }),
+            )
+        except Exception:
+            _request_logger.exception(
+                "webhook delivery response %s",
+                _json_log({
+                    "job_id": job_id,
+                    "webhook_url": _safe_webhook_url(webhook_url),
+                    "status": "failed",
+                    "duration_ms": round((time.perf_counter() - delivery_started_at) * 1000, 2),
+                }),
+            )
 
     def _safe_upload_filename(upload: UploadFile, index: int) -> str:
         raw = (upload.filename or "").strip().replace("\\", "/")
@@ -526,20 +801,21 @@ try:
     ) -> JSONResponse | StreamingResponse:
         _require_api_key(http_request)
         _require_auth()
-        provider = _get_provider()
-        messages = _request_messages_to_internal(request.messages)
-        tools = _parse_tools(request.tools)
-        stop = _normalize_stop(request.stop)
-        max_tokens = _max_tokens_from_request(request)
-
-        subagent = request.subagent or http_request.headers.get("x-openai-subagent")
-        memgen_request_header = http_request.headers.get("x-openai-memgen-request")
-        memgen_request: bool | None = request.memgen_request
-        if memgen_request is None and memgen_request_header is not None:
-            memgen_request = memgen_request_header.lower() not in ("false", "0", "")
-        previous_response_id = request.previous_response_id
 
         if request.stream:
+            provider = _get_provider()
+            messages = _request_messages_to_internal(request.messages)
+            tools = _parse_tools(request.tools)
+            stop = _normalize_stop(request.stop)
+            max_tokens = _max_tokens_from_request(request)
+
+            subagent = request.subagent or http_request.headers.get("x-openai-subagent")
+            memgen_request_header = http_request.headers.get("x-openai-memgen-request")
+            memgen_request: bool | None = request.memgen_request
+            if memgen_request is None and memgen_request_header is not None:
+                memgen_request = memgen_request_header.lower() not in ("false", "0", "")
+            previous_response_id = request.previous_response_id
+
             async def _stream() -> AsyncIterator[str]:
                 request_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
                 created = int(time.time())
@@ -689,68 +965,72 @@ try:
             return StreamingResponse(_stream(), media_type="text/event-stream")
 
         # Non-streaming
-        response = provider.chat(
-            messages,
-            model=request.model,
-            tools=tools,
-            tool_choice=request.tool_choice,
-            temperature=request.temperature,
-            reasoning_effort=request.reasoning_effort,
-            max_tokens=max_tokens,
-            stop=stop,
-            prompt_cache_key=request.prompt_cache_key,
-            subagent=subagent,
-            memgen_request=memgen_request,
-            previous_response_id=previous_response_id,
-            service_tier=request.service_tier,
-            text=request.text,
-            client_metadata=request.client_metadata,
-        )
-
-        choices: list[dict[str, Any]] = [{
-            "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": response.content,
-            },
-            "finish_reason": response.finish_reason,
-        }]
-
-        if response.tool_calls:
-            choices[0]["message"]["tool_calls"] = [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.name,
-                        "arguments": json.dumps(tc.arguments, ensure_ascii=False),
-                    },
-                }
-                for tc in response.tool_calls
-            ]
-
-        if response.reasoning_content:
-            choices[0]["message"]["reasoning_content"] = response.reasoning_content
-
-        result: dict[str, Any] = {
-            "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": _openai_model_id(request.model),
-            "choices": choices,
-        }
-
-        if response.usage:
-            total_tokens = response.usage.total_tokens or (
-                response.usage.prompt_tokens + response.usage.completion_tokens
-            )
-            result["usage"] = {
-                "prompt_tokens": response.usage.prompt_tokens,
-                "completion_tokens": response.usage.completion_tokens,
-                "total_tokens": total_tokens,
-            }
-
+        result = _chat_completion_response_payload(request, http_request.headers)
         return JSONResponse(content=result)
+
+    @app.post("/v1/jobs/chat/completions")
+    async def chat_completions_webhook(
+        request: WebhookChatCompletionRequest,
+        http_request: Request,
+        background_tasks: BackgroundTasks,
+    ) -> JSONResponse:
+        _require_api_key(http_request)
+        _require_auth()
+        job_id = f"job-{uuid.uuid4().hex[:24]}"
+        request_headers = dict(http_request.headers)
+        _request_logger.info(
+            "webhook job request %s",
+            _json_log(_chat_request_log_fields(job_id=job_id, request=request, headers=request_headers)),
+        )
+        if request.stream:
+            _request_logger.info(
+                "webhook job queued response %s",
+                _json_log({
+                    "job_id": job_id,
+                    "http_status": 400,
+                    "status": "rejected",
+                    "reason": "stream_not_supported",
+                }),
+            )
+            raise HTTPException(status_code=400, detail="stream is not supported for webhook jobs")
+        try:
+            _validate_webhook_url(request.webhook_url)
+        except HTTPException:
+            _request_logger.info(
+                "webhook job queued response %s",
+                _json_log({
+                    "job_id": job_id,
+                    "http_status": 400,
+                    "status": "rejected",
+                    "reason": "invalid_webhook_url",
+                }),
+            )
+            raise
+
+        background_tasks.add_task(
+            _run_chat_completion_webhook_job,
+            job_id,
+            request,
+            request_headers,
+            request.webhook_url,
+        )
+        _request_logger.info(
+            "webhook job queued response %s",
+            _json_log({
+                "job_id": job_id,
+                "http_status": 202,
+                "status": "queued",
+                "object": "chat.completion.webhook.job",
+            }),
+        )
+        return JSONResponse(
+            status_code=202,
+            content={
+                "id": job_id,
+                "object": "chat.completion.webhook.job",
+                "status": "queued",
+            },
+        )
 
     @app.post("/v1/images/generations")
     async def images_generations(request: ImageGenerationRequest, http_request: Request) -> JSONResponse:
