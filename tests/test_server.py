@@ -19,6 +19,22 @@ class RecordingSummaryProvider:
         return self.summary
 
 
+class RecordingChatProvider:
+    def __init__(self, content: str = "webhook answer") -> None:
+        self.content = content
+        self.calls: list[dict] = []
+
+    def chat(self, messages, **kwargs):
+        from codex_as_api.messages import AssistantResponse, Usage
+
+        self.calls.append({"messages": messages, **kwargs})
+        return AssistantResponse(
+            content=self.content,
+            finish_reason="stop",
+            usage=Usage(prompt_tokens=4, completion_tokens=3),
+        )
+
+
 @pytest.fixture()
 def client():
     from fastapi.testclient import TestClient
@@ -433,6 +449,146 @@ def test_chat_completions_missing_auth_returns_auth_error(tmp_path, monkeypatch)
     finally:
         server_mod.AUTH_PATH = old_auth_path
         server_mod._provider = None
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/jobs/chat/completions
+# ---------------------------------------------------------------------------
+
+
+def test_chat_completions_webhook_queues_and_posts_response(monkeypatch, caplog):
+    from fastapi.testclient import TestClient
+
+    import codex_as_api.server as server_mod
+    from codex_as_api.server import app
+
+    caplog.set_level(logging.INFO, logger="gunicorn.error")
+    provider = RecordingChatProvider("async answer")
+    deliveries: list[dict] = []
+    monkeypatch.setattr(server_mod, "API_KEY", None)
+    monkeypatch.setattr(server_mod, "_require_auth", lambda: None)
+    monkeypatch.setattr(server_mod, "_provider", provider)
+    monkeypatch.setattr(
+        server_mod,
+        "_post_job_webhook",
+        lambda webhook_url, payload: deliveries.append({"webhook_url": webhook_url, "payload": payload}),
+    )
+
+    c = TestClient(app, raise_server_exceptions=False)
+    resp = c.post(
+        "/v1/jobs/chat/completions",
+        headers={
+            "x-openai-subagent": "header-agent",
+            "x-openai-memgen-request": "true",
+        },
+        json={
+            "model": "gpt-5.5",
+            "webhook_url": "https://example.test/webhook?token=secret-token",
+            "messages": [
+                {"role": "system", "content": "You are helpful."},
+                {"role": "user", "content": "Hello"},
+            ],
+        },
+    )
+
+    assert resp.status_code == 202
+    body = resp.json()
+    assert body["object"] == "chat.completion.webhook.job"
+    assert body["status"] == "queued"
+    assert body["id"].startswith("job-")
+
+    assert len(deliveries) == 1
+    assert deliveries[0]["webhook_url"] == "https://example.test/webhook?token=secret-token"
+    payload = deliveries[0]["payload"]
+    assert payload["id"] == body["id"]
+    assert payload["object"] == "chat.completion.webhook"
+    assert payload["status"] == "completed"
+    assert payload["response"]["object"] == "chat.completion"
+    assert payload["response"]["choices"][0]["message"]["content"] == "async answer"
+    assert payload["response"]["usage"] == {
+        "prompt_tokens": 4,
+        "completion_tokens": 3,
+        "total_tokens": 7,
+    }
+
+    assert len(provider.calls) == 1
+    assert provider.calls[0]["subagent"] == "header-agent"
+    assert provider.calls[0]["memgen_request"] is True
+
+    logs = "\n".join(record.getMessage() for record in caplog.records if record.name == "gunicorn.error")
+    assert "webhook job request" in logs
+    assert '"message_count": 2' in logs
+    assert '"message_roles": {"system": 1, "user": 1}' in logs
+    assert "webhook job queued response" in logs
+    assert '"status": "queued"' in logs
+    assert "webhook job response" in logs
+    assert '"content_chars": 12' in logs
+    assert "webhook delivery request" in logs
+    assert "https://example.test/webhook" in logs
+    assert "secret-token" not in logs
+
+
+def test_chat_completions_webhook_rejects_stream(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    import codex_as_api.server as server_mod
+    from codex_as_api.server import app
+
+    monkeypatch.setattr(server_mod, "API_KEY", None)
+    monkeypatch.setattr(server_mod, "_require_auth", lambda: None)
+
+    c = TestClient(app, raise_server_exceptions=False)
+    resp = c.post(
+        "/v1/jobs/chat/completions",
+        json={
+            "model": "gpt-5.5",
+            "webhook_url": "https://example.test/webhook",
+            "stream": True,
+            "messages": [
+                {"role": "system", "content": "You are helpful."},
+                {"role": "user", "content": "Hello"},
+            ],
+        },
+    )
+
+    assert resp.status_code == 400
+    assert "stream is not supported" in resp.json()["detail"]
+
+
+def test_chat_completions_webhook_rejects_invalid_webhook_url(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    import codex_as_api.server as server_mod
+    from codex_as_api.server import app
+
+    monkeypatch.setattr(server_mod, "API_KEY", None)
+    monkeypatch.setattr(server_mod, "_require_auth", lambda: None)
+
+    c = TestClient(app, raise_server_exceptions=False)
+    resp = c.post(
+        "/v1/jobs/chat/completions",
+        json={
+            "model": "gpt-5.5",
+            "webhook_url": "/relative-webhook",
+            "messages": [
+                {"role": "system", "content": "You are helpful."},
+                {"role": "user", "content": "Hello"},
+            ],
+        },
+    )
+
+    assert resp.status_code == 400
+    assert "webhook_url" in resp.json()["detail"]
+
+
+def test_webhook_delivery_headers_include_job_webhook_credential(monkeypatch):
+    import codex_as_api.server as server_mod
+
+    monkeypatch.setattr(server_mod, "JOB_WEBHOOK_CREDENTIAL", "secret-webhook-token")
+
+    headers = server_mod._webhook_delivery_headers()
+
+    assert headers["Authorization"] == "Bearer secret-webhook-token"
 
 
 def test_chat_completions_stream_missing_auth_returns_401_before_streaming(tmp_path, monkeypatch):

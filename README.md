@@ -15,6 +15,7 @@ Use ChatGPT / Codex OAuth as a local OpenAI-compatible API server.
 - **Claude Code ready** — use Codex models directly from Claude Code CLI
 - **Streaming** — full SSE streaming for both OpenAI and Anthropic protocols
 - **Tool calling** — function calls, tool results, and parallel tool calls
+- **Webhook jobs** — `POST /v1/jobs/chat/completions` queues a chat completion and POSTs the result to your webhook in the Python/FastAPI server
 - **Image support** — generation, inspection, and base64 image passthrough (including tool result images)
 - **Multipart file summarization** — `POST /v1/files/summarize` accepts text, image, and PDF uploads in the Python/FastAPI server
 - **Reasoning** — configurable reasoning effort with streaming thinking content
@@ -191,6 +192,7 @@ CODEX_AS_API_WORKER_TIMEOUT=0
 CODEX_AS_API_GRACEFUL_TIMEOUT=30
 CODEX_AS_API_KEEP_ALIVE=5
 CODEX_AS_API_API_KEY=<generate-a-secret>
+JOB_WEBHOOK_CREDENTIAL=<generate-a-webhook-secret>
 ```
 
 Railway provides `PORT`; do not set it manually.
@@ -228,6 +230,8 @@ Environment variables (Python, Rust, and TypeScript):
 | `CODEX_AS_API_MODEL` | `gpt-5.5` | Model identifier passed to Codex backend |
 | `CODEX_AS_API_AUTH_PATH` | `~/.codex/auth.json` | Path to OAuth credentials file |
 | `CODEX_AS_API_API_KEY` | unset | Optional fixed bearer token required for `/v1` API calls |
+| `JOB_WEBHOOK_CREDENTIAL` | unset | Optional bearer token sent on Python/FastAPI webhook job callbacks |
+| `JOB_WEBHOOK_TIMEOUT_SECONDS` | `30` | Timeout for Python/FastAPI webhook job callback POST requests |
 
 ### Supported Models
 
@@ -312,6 +316,59 @@ curl http://localhost:18080/v1/chat/completions \
     ]
   }'
 ```
+
+### `POST /v1/jobs/chat/completions`
+
+Queue a non-streaming chat completion and receive the final result through a webhook callback. This endpoint is implemented in the Python/FastAPI server used by the Docker deployment. The request body is the same as `POST /v1/chat/completions`, plus a required `webhook_url`. `stream: true` is rejected for webhook jobs.
+
+If `JOB_WEBHOOK_CREDENTIAL` is set, callback requests include:
+
+```text
+Authorization: Bearer <JOB_WEBHOOK_CREDENTIAL>
+```
+
+```bash
+curl http://localhost:18080/v1/jobs/chat/completions \
+  -H "Authorization: Bearer $CODEX_AS_API_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-5.5",
+    "webhook_url": "https://your-service.example/webhooks/codex-job",
+    "messages": [
+      {"role": "system", "content": "You are a helpful assistant."},
+      {"role": "user", "content": "Summarize this request asynchronously."}
+    ]
+  }'
+```
+
+Immediate response:
+
+```json
+{
+  "id": "job-abc123",
+  "object": "chat.completion.webhook.job",
+  "status": "queued"
+}
+```
+
+Webhook success callback:
+
+```json
+{
+  "id": "job-abc123",
+  "object": "chat.completion.webhook",
+  "status": "completed",
+  "created": 1760000000,
+  "response": {
+    "object": "chat.completion",
+    "choices": [
+      {"message": {"role": "assistant", "content": "..."}, "finish_reason": "stop"}
+    ]
+  }
+}
+```
+
+If generation fails after the job is queued, the same webhook receives `status: "failed"` with an `error` object.
 
 ### `POST /v1/messages`
 
