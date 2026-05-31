@@ -581,6 +581,44 @@ def test_chat_completions_webhook_rejects_invalid_webhook_url(monkeypatch):
     assert "webhook_url" in resp.json()["detail"]
 
 
+def test_chat_completions_webhook_validation_error_logs_request_and_response(monkeypatch, caplog):
+    from fastapi.testclient import TestClient
+
+    import codex_as_api.server as server_mod
+    from codex_as_api.server import app
+
+    caplog.set_level(logging.INFO, logger="gunicorn.error")
+    monkeypatch.setattr(server_mod, "API_KEY", None)
+    monkeypatch.setattr(server_mod, "_require_auth", lambda: pytest.fail("_require_auth should not run"))
+
+    c = TestClient(app, raise_server_exceptions=False)
+    resp = c.post(
+        "/v1/jobs/chat/completions",
+        json={
+            "model": "gpt-5.5",
+            "messages": [
+                {"role": "system", "content": "You are helpful."},
+                {"role": "user", "content": "Hello 422 validation body"},
+            ],
+            "client_metadata": {
+                "token": "secret-client-token",
+            },
+        },
+    )
+
+    assert resp.status_code == 422
+    logs = "\n".join(record.getMessage() for record in caplog.records if record.name == "gunicorn.error")
+    assert "request validation error" in logs
+    assert '"path": "/v1/jobs/chat/completions"' in logs
+    assert '"status_code": 422' in logs
+    assert "Hello 422 validation body" in logs
+    assert '"webhook_url"' in logs
+    assert "Field required" in logs
+    assert "secret-client-token" not in logs
+    assert "<redacted>" in logs
+    assert "webhook job request" not in logs
+
+
 def test_webhook_delivery_headers_include_job_webhook_credential(monkeypatch):
     import codex_as_api.server as server_mod
 
