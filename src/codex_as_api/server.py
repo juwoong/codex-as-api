@@ -154,7 +154,7 @@ try:
     from fastapi.encoders import jsonable_encoder
     from fastapi.exceptions import RequestValidationError
     from fastapi.responses import JSONResponse, StreamingResponse
-    from pydantic import BaseModel
+    from pydantic import BaseModel, ValidationError
     from starlette.datastructures import FormData
     from starlette.datastructures import UploadFile as StarletteUploadFile
 
@@ -228,10 +228,17 @@ try:
 
     @app.exception_handler(RequestValidationError)
     async def _request_validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
-        response_body = {"detail": jsonable_encoder(exc.errors())}
         raw_body = getattr(exc, "body", None)
         if raw_body is None:
             raw_body = await request.body()
+        return _validation_error_response(request, raw_body, exc.errors())
+
+    def _validation_error_response(
+        request: Request,
+        raw_body: Any,
+        errors: list[dict[str, Any]],
+    ) -> JSONResponse:
+        response_body = {"detail": jsonable_encoder(_errors_with_body_loc(errors))}
         log_payload = {
             "method": request.method,
             "path": request.url.path,
@@ -241,6 +248,17 @@ try:
         }
         _request_logger.error("request validation error %s", _json_log(log_payload))
         return JSONResponse(status_code=422, content=response_body)
+
+    def _errors_with_body_loc(errors: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        normalized: list[dict[str, Any]] = []
+        for error in errors:
+            item = dict(error)
+            loc = list(item.get("loc") or [])
+            if not loc or loc[0] != "body":
+                loc = ["body", *loc]
+            item["loc"] = loc
+            normalized.append(item)
+        return normalized
 
     # ------------------------------------------------------------------
     # Request/response schemas
@@ -397,17 +415,30 @@ try:
     def _json_log(fields: dict[str, Any]) -> str:
         return json.dumps(fields, ensure_ascii=False, sort_keys=True, default=str)
 
-    SENSITIVE_LOG_KEY_PARTS = frozenset({
+    SENSITIVE_LOG_EXACT_KEYS = frozenset({
         "authorization",
         "api_key",
         "apikey",
         "access_token",
         "refresh_token",
         "id_token",
+        "token",
+        "tokens",
+    })
+    SENSITIVE_LOG_KEY_PARTS = frozenset({
         "credential",
         "password",
         "secret",
-        "token",
+    })
+    SAFE_TOKEN_COUNT_KEYS = frozenset({
+        "max_tokens",
+        "max_completion_tokens",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "cached_tokens",
+        "cached_input_tokens",
+        "cache_read_input_tokens",
     })
 
     def _truncate_log_text(value: str, max_chars: int = VALIDATION_LOG_VALUE_MAX_CHARS) -> str:
@@ -417,7 +448,16 @@ try:
 
     def _redact_log_value(value: Any, key: str | None = None) -> Any:
         lowered_key = key.lower() if key else ""
-        if lowered_key and any(part in lowered_key for part in SENSITIVE_LOG_KEY_PARTS):
+        if (
+            lowered_key
+            and lowered_key not in SAFE_TOKEN_COUNT_KEYS
+            and (
+                lowered_key in SENSITIVE_LOG_EXACT_KEYS
+                or lowered_key.endswith("_token")
+                or lowered_key.endswith("-token")
+                or any(part in lowered_key for part in SENSITIVE_LOG_KEY_PARTS)
+            )
+        ):
             return "<redacted>"
         if lowered_key == "webhook_url" and isinstance(value, str):
             return _safe_webhook_url(value)
@@ -445,6 +485,16 @@ try:
         if len(encoded) <= VALIDATION_LOG_BODY_MAX_CHARS:
             return redacted
         return _truncate_log_text(encoded, VALIDATION_LOG_BODY_MAX_CHARS)
+
+    def _webhook_chat_completion_request_from_body(raw_body: Any) -> WebhookChatCompletionRequest:
+        body = raw_body
+        if isinstance(raw_body, dict):
+            wrapped = raw_body.get("requests", raw_body.get("request"))
+            if isinstance(wrapped, dict):
+                body = dict(wrapped)
+                if "webhook_url" in raw_body:
+                    body["webhook_url"] = raw_body["webhook_url"]
+        return WebhookChatCompletionRequest.model_validate(body)
 
     def _safe_webhook_url(webhook_url: str) -> str:
         parsed = urllib.parse.urlparse(webhook_url)
@@ -1039,10 +1089,15 @@ try:
 
     @app.post("/v1/jobs/chat/completions")
     async def chat_completions_webhook(
-        request: WebhookChatCompletionRequest,
         http_request: Request,
         background_tasks: BackgroundTasks,
     ) -> JSONResponse:
+        raw_body = await http_request.json()
+        try:
+            request = _webhook_chat_completion_request_from_body(raw_body)
+        except ValidationError as exc:
+            return _validation_error_response(http_request, raw_body, exc.errors())
+
         _require_api_key(http_request)
         _require_auth()
         job_id = f"job-{uuid.uuid4().hex[:24]}"

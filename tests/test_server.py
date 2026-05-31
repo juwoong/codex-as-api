@@ -528,6 +528,56 @@ def test_chat_completions_webhook_queues_and_posts_response(monkeypatch, caplog)
     assert "secret-token" not in logs
 
 
+def test_chat_completions_webhook_accepts_wrapped_requests_body(monkeypatch, caplog):
+    from fastapi.testclient import TestClient
+
+    import codex_as_api.server as server_mod
+    from codex_as_api.server import app
+
+    caplog.set_level(logging.INFO, logger="gunicorn.error")
+    provider = RecordingChatProvider("wrapped answer")
+    deliveries: list[dict] = []
+    monkeypatch.setattr(server_mod, "API_KEY", None)
+    monkeypatch.setattr(server_mod, "_require_auth", lambda: None)
+    monkeypatch.setattr(server_mod, "_provider", provider)
+    monkeypatch.setattr(
+        server_mod,
+        "_post_job_webhook",
+        lambda webhook_url, payload: deliveries.append({"webhook_url": webhook_url, "payload": payload}),
+    )
+
+    c = TestClient(app, raise_server_exceptions=False)
+    resp = c.post(
+        "/v1/jobs/chat/completions",
+        json={
+            "requests": {
+                "model": "gpt-5.5",
+                "messages": [
+                    {"role": "system", "content": "You are helpful."},
+                    {"role": "user", "content": "Hello wrapped"},
+                ],
+                "max_tokens": 2048,
+                "stream": False,
+                "metadata": {"token": "secret-metadata-token"},
+                "response_format": {"type": "json_object"},
+                "temperature": 0.2,
+            },
+            "webhook_url": "https://example.test/webhook?token=secret-token",
+        },
+    )
+
+    assert resp.status_code == 202
+    body = resp.json()
+    assert body["status"] == "queued"
+    assert deliveries[0]["payload"]["response"]["choices"][0]["message"]["content"] == "wrapped answer"
+    assert provider.calls[0]["max_tokens"] == 2048
+
+    logs = "\n".join(record.getMessage() for record in caplog.records if record.name == "gunicorn.error")
+    assert "request validation error" not in logs
+    assert '"max_tokens": 2048' in logs
+    assert "secret-token" not in logs
+
+
 def test_chat_completions_webhook_rejects_stream(monkeypatch):
     from fastapi.testclient import TestClient
 
@@ -596,6 +646,7 @@ def test_chat_completions_webhook_validation_error_logs_request_and_response(mon
         "/v1/jobs/chat/completions",
         json={
             "model": "gpt-5.5",
+            "max_tokens": 2048,
             "messages": [
                 {"role": "system", "content": "You are helpful."},
                 {"role": "user", "content": "Hello 422 validation body"},
@@ -612,6 +663,7 @@ def test_chat_completions_webhook_validation_error_logs_request_and_response(mon
     assert '"path": "/v1/jobs/chat/completions"' in logs
     assert '"status_code": 422' in logs
     assert "Hello 422 validation body" in logs
+    assert '"max_tokens": 2048' in logs
     assert '"webhook_url"' in logs
     assert "Field required" in logs
     assert "secret-client-token" not in logs

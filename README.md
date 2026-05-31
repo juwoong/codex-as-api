@@ -343,6 +343,18 @@ curl http://localhost:18080/v1/jobs/chat/completions \
   }'
 ```
 
+For async-job clients that keep the chat completion body under a wrapper, this endpoint also accepts:
+
+```json
+{
+  "requests": {
+    "model": "gpt-5.5",
+    "messages": []
+  },
+  "webhook_url": "https://your-service.example/webhooks/codex-job"
+}
+```
+
 Immediate response:
 
 ```json
